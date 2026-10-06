@@ -821,8 +821,8 @@ export const register: Register = on => {
     // Drawn by log.tsx where the surface has Client; plain buttons elsewhere (vscode, mobile).
     let list
     if (e.surface === 'terminal' || e.surface === 'desktop') {
-      const { Client } = $.ui.resolve(e)
-      list = Client({ key: 'log', module: './log.tsx', width, props: { rows: drawn } })
+      const table = $.ui.resolve(e)
+      list = table.Client({ key: 'log', module: './log.tsx', width, props: { rows: drawn } })
     } else {
       list = drawn.map((r, i) =>
         r.id ? (
