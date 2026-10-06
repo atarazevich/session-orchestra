@@ -300,13 +300,16 @@ async function readFrom($: EngineInterface, file: string, offset: number) {
 }
 
 // A compacted session goes on in a new transcript; its summary names the one before.
-async function chainOf($: EngineInterface, file: string, seen = new Set<string>()): Promise<string[]> {
-  seen.add(file)
-  const head = await $.process.run(['head', '-c', '400000', file])
-  const before = /read the full transcript at: (\/[^\s"\\]+\.jsonl)/.exec(head.stdout)?.[1]
-  if (!before || seen.has(before) || seen.size > 5) return [file]
-  const older = await chainOf($, before, seen)
-  return [...older, file]
+async function chainOf($: EngineInterface, file: string) {
+  const chain = [file]
+  for (let oldest = file; chain.length < 6; ) {
+    const head = await $.process.run(['head', '-c', '400000', oldest])
+    const before = /read the full transcript at: (\/[^\s"\\]+\.jsonl)/.exec(head.stdout)?.[1]
+    if (!before || chain.includes(before)) break
+    chain.unshift(before)
+    oldest = before
+  }
+  return chain
 }
 
 // A session's transcript sits under its folder, spelled the way Claude Code spells project folders.
@@ -852,7 +855,7 @@ export const register: Register = on => {
         )}
         <Box flexDirection="column" height={logRows} overflow="hidden">
           {listed.length === 0 && <Text dimColor>Quiet so far.</Text>}
-          {Client ? (
+          {e.surface === 'terminal' || e.surface === 'desktop' ? (
           <Client
             key="log"
             module="./log.tsx"
