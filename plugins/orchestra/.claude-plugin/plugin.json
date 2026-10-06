@@ -1,0 +1,9 @@
+{
+  "name": "orchestra",
+  "version": "0.1.0",
+  "description": "A side pane that shows the messages your Claude Code sessions send each other: who this chat talks to, how each session is doing, and every message between them.",
+  "author": { "name": "Oleksii Tarazevych" },
+  "license": "MIT",
+  "keywords": ["sessions", "multi-agent", "SendMessage", "pane"],
+  "types": "./types/index.d.ts"
+}
