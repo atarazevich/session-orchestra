@@ -84,6 +84,28 @@ The pane docks as a sidebar from 144 terminal columns; at any width `/orchestra`
 
 If you run your sessions in herdr, its `herdr agent prompt <pane> "…"` sends count as messages too.
 
+## What it runs and what it hooks
+
+Orchestra sends nothing anywhere. The plugin directory asks each plugin to list the programs it starts and the events it hooks, so here they are.
+
+**Programs**, each started directly with fixed arguments:
+
+| Program | Why |
+|---|---|
+| `sh -c` with `tail -c`, `head -c` and `wc -c` | Reads a transcript from where it last stopped, in 3 MB pieces, and cuts at the last complete line. The plugin API caps a program's output at 4 MiB, so a long transcript cannot be read in one go. The only argument is the transcript's path. |
+| `head -c 400000 <transcript>` | Reads the start of a transcript to find the earlier transcript a compacted session continues. |
+| `tail -c <bytes> <transcript>` | Reads the end of a transcript: another session's model, effort and context, or this chat's latest messages while it is off. |
+| `find ~/.claude/projects -maxdepth 2 -name <session id>.jsonl` | Finds a session's transcript. |
+| `herdr agent list` | Only if herdr is installed: gets pane names, so herdr sends show the session's name. |
+
+**Events it hooks**, every one passed on unchanged:
+
+- `SendMessage` tool calls: it reads the recipient's name to count the conversation, and the call runs as before.
+- Submitted prompts: for a message from another session, it reads the sender's name. The prompt is not changed.
+- Its own pane: draw, scroll and close. The hint line under the prompt: it adds the clickable note.
+
+It adds one command, `/orchestra`. It runs no slash commands, submits no prompts, and makes no network or MCP calls.
+
 ## Requirements and limits
 
 - Claude Code **2.1.289** or newer, in a terminal. It is built on Claude Code's plugin API for function hooks, which is early access and may change between releases.
@@ -95,7 +117,6 @@ If you run your sessions in herdr, its `herdr agent prompt <pane> "…"` sends c
 
 ```sh
 claude plugin validate plugins/orchestra
-claude plugin test plugins/orchestra
 ```
 
 Run Claude Code with `--plugin-dir plugins/orchestra` to try changes: the folder is watched and reloads on save.
