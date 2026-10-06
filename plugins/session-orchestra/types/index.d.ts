@@ -16,7 +16,7 @@ export type BusLine = { id: string; ts: number; from: string; to: string; text: 
 
 declare module 'claude-code' {
   interface PluginState {
-    orchestra: {
+    'session-orchestra': {
       sessions: SessionView[]
       bus: BusLine[]
       // Rows scrolled back from the newest message; 0 follows.

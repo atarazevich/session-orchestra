@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type { BusLine, SessionView } from '../types'
 import { demoData } from './demo'
@@ -14,16 +14,16 @@ const DEMO = 'demo'
 const YOU = '@you'
 const SELF = '@self'
 
-const sessions = atom({ plugin: 'orchestra', key: 'sessions' } as const, [])
-const bus = atom({ plugin: 'orchestra', key: 'bus' } as const, [])
-const logBack = atom({ plugin: 'orchestra', key: 'logBack' } as const, 0)
-const selected = atom({ plugin: 'orchestra', key: 'selected' } as const, '')
-const readerOffset = atom({ plugin: 'orchestra', key: 'readerOffset' } as const, 0)
-const page = atom({ plugin: 'orchestra', key: 'page' } as const, 0)
-const filter = atom({ plugin: 'orchestra', key: 'filter' } as const, '')
-const heard = atom({ plugin: 'orchestra', key: 'heard' } as const, { names: [], count: 0 })
-const paneUp = atom({ plugin: 'orchestra', key: 'paneUp' } as const, false)
-const selfName = atom({ plugin: 'orchestra', key: 'selfName' } as const, '')
+const sessions = atom({ plugin: 'session-orchestra', key: 'sessions' } as const, [])
+const bus = atom({ plugin: 'session-orchestra', key: 'bus' } as const, [])
+const logBack = atom({ plugin: 'session-orchestra', key: 'logBack' } as const, 0)
+const selected = atom({ plugin: 'session-orchestra', key: 'selected' } as const, '')
+const readerOffset = atom({ plugin: 'session-orchestra', key: 'readerOffset' } as const, 0)
+const page = atom({ plugin: 'session-orchestra', key: 'page' } as const, 0)
+const filter = atom({ plugin: 'session-orchestra', key: 'filter' } as const, '')
+const heard = atom({ plugin: 'session-orchestra', key: 'heard' } as const, { names: [], count: 0 })
+const paneUp = atom({ plugin: 'session-orchestra', key: 'paneUp' } as const, false)
+const selfName = atom({ plugin: 'session-orchestra', key: 'selfName' } as const, '')
 
 const ACCENT = '#E8875B'
 const HUB = '#6FC3DF'
@@ -305,7 +305,8 @@ async function chainOf($: EngineInterface, file: string, seen = new Set<string>(
   const head = await $.process.run(['head', '-c', '400000', file])
   const before = /read the full transcript at: (\/[^\s"\\]+\.jsonl)/.exec(head.stdout)?.[1]
   if (!before || seen.has(before) || seen.size > 5) return [file]
-  return [...(await chainOf($, before, seen)), file]
+  const older = await chainOf($, before, seen)
+  return [...older, file]
 }
 
 // A session's transcript sits under its folder, spelled the way Claude Code spells project folders.
@@ -439,7 +440,11 @@ async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'mi
   const own = found.find(s => s.sessionId === sessionId)?.name
   const nameOf = await namer($, found)
   const earlier: BusLine[] = []
-  for (const file of (await chainOf($, transcript)).slice(0, -1)) earlier.push(...parseBus((await readFrom($, file, 0)).text, nameOf))
+  const chain = await chainOf($, transcript)
+  for (const file of chain.slice(0, -1)) {
+    const got = await readFrom($, file, 0)
+    earlier.push(...parseBus(got.text, nameOf))
+  }
   // switched again meanwhile: that switch owns the watch
   if (my !== generation) return 'superseded'
   history = earlier
@@ -593,8 +598,9 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    // Surfaces without Client (vscode, mobile) get the list as plain buttons.
-    const { Box, Button, Text, Client } = $.ui.resolve(e) as Elements[typeof e.surface] & Partial<Pick<Elements['terminal'], 'Client'>>
+    // Surfaces without Client (vscode, mobile) get undefined, and the list as plain buttons.
+    // @ts-expect-error Client is on the terminal and desktop tables only
+    const { Box, Button, Text, Client } = $.ui.resolve(e)
     const width = Math.max(44, e.props.bodyColumns ?? 64)
     const height = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     const views = await read($, sessions)

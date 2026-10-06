@@ -4,7 +4,7 @@
 
 When one session hands work to others (a lead and its teams, a planner and its workers), they talk through `SendMessage`. Those messages end up scattered through each session's transcript. Orchestra reads them back and draws them in one place: which sessions this chat talks to, how each is doing, every message between them, and the one you pick, in full.
 
-![orchestra: sessions, messages and the picked message](docs/demo.png)
+![orchestra: sessions, messages and the picked message](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/demo.png)
 
 ## What it is, and what it is not
 
@@ -19,7 +19,7 @@ Orchestra is **a view, and only a view**:
 
 ### Sessions
 
-![Sessions](docs/sessions.png)
+![Sessions](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/sessions.png)
 
 One card for each session this chat has messaged or heard from, the most recent first:
 
@@ -31,13 +31,13 @@ Six cards to a page (`‹ 1 2 ›`). Sessions that are no longer running are nam
 
 ### Messages
 
-![Messages](docs/messages.png)
+![Messages](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/messages.png)
 
 Every message between you, this chat and those sessions, one line each: time, sender → receiver, the start of the text. A dotted row opens each day. The wheel scrolls the list; `[ ↓ 12 newer ]` jumps back to the newest. **Click a line** to read it.
 
 ### Message
 
-![Message](docs/message.png)
+![Message](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/message.png)
 
 The message you clicked, or the newest one, in full, with `**bold**` and `` `code` `` drawn. The wheel scrolls a long one; `[ copy ]` puts it on the clipboard.
 
@@ -45,9 +45,9 @@ The sessions stay where they are while the two lists scroll.
 
 ### When the pane is closed
 
-![The note on the hint line](docs/hint.png)
+![The note on the hint line](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/hint.png)
 
-![The note under the pointer](docs/hint-hover.png)
+![The note under the pointer](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/hint-hover.png)
 
 The dim hint line under the prompt ends with a note, next to Claude Code's own (`← 5 agents`): `◆ 4 sessions ⇄ 41`, the sessions this chat talks to and the messages between them. **Click it** to open the pane. In a session where orchestra is off, the note appears once this chat messages another session or hears from one; a click turns orchestra on there. Nothing pops up.
 

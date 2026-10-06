@@ -1,13 +1,13 @@
 {
-  "name": "orchestra",
-  "description": "orchestra: a side pane for Claude Code that shows the messages your sessions send each other.",
+  "name": "session-orchestra",
+  "description": "session-orchestra: a side pane for Claude Code that shows the messages your sessions send each other.",
   "owner": {
     "name": "Oleksii Tarazevych"
   },
   "plugins": [
     {
-      "name": "orchestra",
-      "source": "./plugins/orchestra",
+      "name": "session-orchestra",
+      "source": "./plugins/session-orchestra",
       "description": "A side pane that shows the messages your Claude Code sessions send each other."
     }
   ]
