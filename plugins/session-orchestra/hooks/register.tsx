@@ -822,7 +822,7 @@ export const register: Register = on => {
     let list
     if (e.surface === 'terminal' || e.surface === 'desktop') {
       const { Client } = $.ui.resolve(e)
-      list = <Client key="log" module="./log.tsx" width={width} props={{ rows: drawn }} />
+      list = Client({ key: 'log', module: './log.tsx', width, props: { rows: drawn } })
     } else {
       list = drawn.map((r, i) =>
         r.id ? (
