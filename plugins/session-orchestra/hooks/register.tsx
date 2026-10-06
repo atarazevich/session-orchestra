@@ -601,9 +601,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    // Surfaces without Client (vscode, mobile) get undefined, and the list as plain buttons.
-    // @ts-expect-error Client is on the terminal and desktop tables only
-    const { Box, Button, Text, Client } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const width = Math.max(44, e.props.bodyColumns ?? 64)
     const height = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     const views = await read($, sessions)
@@ -820,6 +818,22 @@ export const register: Register = on => {
       ],
                 }
     })
+    // Drawn by log.tsx where the surface has Client; plain buttons elsewhere (vscode, mobile).
+    let list
+    if (e.surface === 'terminal' || e.surface === 'desktop') {
+      const { Client } = $.ui.resolve(e)
+      list = <Client key="log" module="./log.tsx" width={width} props={{ rows: drawn }} />
+    } else {
+      list = drawn.map((r, i) =>
+        r.id ? (
+          <Button key={`r-${r.id}`} plain onPress={() => update($, selected, () => r.id ?? '')}>
+            {r.cells.map(c => c.text).join('')}
+          </Button>
+        ) : (
+          <Text key={`d${i}`} dimColor>{r.cells[0]?.text ?? ''}</Text>
+        ),
+      )
+    }
 
     const messageTitle = (
       header(
@@ -855,24 +869,7 @@ export const register: Register = on => {
         )}
         <Box flexDirection="column" height={logRows} overflow="hidden">
           {listed.length === 0 && <Text dimColor>Quiet so far.</Text>}
-          {e.surface === 'terminal' || e.surface === 'desktop' ? (
-          <Client
-            key="log"
-            module="./log.tsx"
-            width={width}
-            props={{ rows: drawn }}
-          />
-          ) : (
-            drawn.map((r, i) =>
-              r.id ? (
-                <Button key={`r-${r.id}`} plain onPress={() => update($, selected, () => r.id ?? '')}>
-                  {r.cells.map(c => c.text).join('')}
-                </Button>
-              ) : (
-                <Text key={`d${i}`} dimColor>{r.cells[0]?.text ?? ''}</Text>
-              ),
-            )
-          )}
+          {list}
         </Box>
         {spacer('gap2')}
         {messageTitle}
