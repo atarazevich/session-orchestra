@@ -88,11 +88,11 @@ If you run your sessions in herdr, its `herdr agent prompt <pane> "…"` sends c
 
 Orchestra sends nothing anywhere. The plugin directory asks each plugin to list the programs it starts and the events it hooks, so here they are.
 
-**Programs** it starts, each by name, with no shell except the transcript reader in the first row:
+**Programs** it starts, each by name and with no shell:
 
 | Program | Why |
 |---|---|
-| `sh -c` with `tail -c`, `head -c` and `wc -c` | Reads a transcript from where it last stopped, in 3 MB pieces, and cuts at the last complete line. The script is fixed text apart from the byte offset and the piece size, which are numbers. The plugin API caps a program's output at 4 MiB, so a long transcript cannot be read in one go. The only argument is the transcript's path. |
+| `tail -c +<offset> <transcript>` | Reads a transcript from where it last stopped. The plugin API keeps only the first 4 MiB of a program's output, so a long transcript takes several reads. |
 | `head -c 400000 <transcript>` | Reads the start of a transcript to find the earlier transcript a compacted session continues. |
 | `tail -c <bytes> <transcript>` | Reads the end of a transcript: another session's model, effort and context, or this chat's latest messages while it is off. |
 | `find ~/.claude/projects -maxdepth 2 -name <session id>.jsonl` | Finds a session's transcript. |

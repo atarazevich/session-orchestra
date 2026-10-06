@@ -8,6 +8,7 @@ import type { LogRow as DrawnRow } from './log'
 const PANE = 'orchestra'
 const POLL_MS = 15_000
 const CHUNK_BYTES = 3_000_000 // under $.process.run's 4 MiB output cap
+const OUTPUT_CAP = 4_194_304 // what $.process.run keeps of a program's output
 const KEEP = 1000
 const MAX_SESSIONS = 24
 const DEMO = 'demo'
@@ -261,40 +262,29 @@ function parseBus(jsonl: string, nameOf: (address: string) => string): BusLine[]
   return lines
 }
 
-// Reads a file from a byte offset to its last complete line, in chunks; answers the text and the new offset.
+// Reads a file from a byte offset to its last complete line; answers the text and the new offset.
+// $.process.run keeps the first OUTPUT_CAP bytes of what a program writes, so a long file takes several reads.
 async function readFrom($: EngineInterface, file: string, offset: number) {
   let text = ''
-  // Inside a line longer than a chunk: its rest, up to the next newline, is dropped.
+  // Inside a line longer than one read: its rest, up to the next newline, is dropped.
   let skipping = false
   for (;;) {
-    // The shell counts the bytes, never the decoded text: "<chunk bytes> <bytes to its last newline>", then those bytes.
-    const chunk = `tail -c +${offset + 1} "$0" | head -c ${CHUNK_BYTES}`
-    const out = await $.process.run(
-      [
-        'sh',
-        '-c',
-        `export LC_ALL=C; c=$(${chunk} | wc -c); k=$({ ${chunk}; printf x; } | tail -n 1 | wc -c); p=$((c - k + 1)); ` +
-          `echo $((c)) $p; if [ $p -gt 0 ]; then ${chunk} | head -c $p; fi`,
-        file,
-      ],
-      { timeoutMs: 20_000 },
-    )
-    const head = /^(\d+) (\d+)\n/.exec(out.stdout)
-    if (out.exitCode !== 0 || !head) break
-    const isFull = Number(head[1]) >= CHUNK_BYTES
-    const upTo = Number(head[2])
-    if (upTo === 0) {
-      if (!isFull) break
-      // a full chunk of one long line: step past its bytes
-      offset += CHUNK_BYTES
+    const out = await $.process.run(['tail', '-c', `+${offset + 1}`, file], { timeoutMs: 20_000 })
+    if (out.exitCode !== 0) break
+    const cut = out.stdout.lastIndexOf('\n') + 1
+    if (cut === 0) {
+      if (!out.isStdoutTruncated) break
+      // a full read of one long line: step past its bytes
+      offset += OUTPUT_CAP
       skipping = true
       continue
     }
-    const whole = out.stdout.slice(head[0].length)
+    const whole = out.stdout.slice(0, cut)
     text += skipping ? whole.slice(whole.indexOf('\n') + 1) : whole
     skipping = false
-    offset += upTo
-    if (!isFull) break
+    // whole lines of UTF-8 encode back to exactly the bytes they were read from
+    offset += new TextEncoder().encode(whole).length
+    if (!out.isStdoutTruncated) break
   }
   return { text, offset }
 }
