@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { Elements, EngineInterface, Register } from 'claude-code'
 
 import type { BusLine, SessionView } from '../types'
 import { demoData } from './demo'
@@ -195,9 +195,9 @@ async function namer($: EngineInterface, found: Registered[]) {
 
 // FNV-1a of the full text, so two messages that start alike keep apart ids.
 const hash = (s: string) => {
-  let h = 0x811c9dc5
-  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193)
-  return (h >>> 0).toString(36)
+  let x = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) x = Math.imul(x ^ s.charCodeAt(i), 0x01000193)
+  return (x >>> 0).toString(36)
 }
 
 // The same message from and to the same sessions within 2 minutes shows once.
@@ -397,7 +397,7 @@ async function poll($: EngineInterface) {
 // Counts one more message with `who` while the mode is off, for the hint under the prompt.
 async function hear($: EngineInterface, who: string) {
   if (watching || isAgentId(who)) return
-  await update($, heard, h => ({ names: h.names.includes(who) ? h.names : [...h.names, who], count: h.count + 1 }))
+  await update($, heard, was => ({ names: was.names.includes(who) ? was.names : [...was.names, who], count: was.count + 1 }))
 }
 
 // On start with the mode off: what this session's transcript already holds.
@@ -593,10 +593,8 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const elements = $.ui.resolve(e)
-    const { Box, Button, Text } = elements
     // Surfaces without Client (vscode, mobile) get the list as plain buttons.
-    const Client = 'Client' in elements ? elements.Client : undefined
+    const { Box, Button, Text, Client } = $.ui.resolve(e) as Elements[typeof e.surface] & Partial<Pick<Elements['terminal'], 'Client'>>
     const width = Math.max(44, e.props.bodyColumns ?? 64)
     const height = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     const views = await read($, sessions)
