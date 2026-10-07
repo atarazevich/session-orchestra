@@ -122,6 +122,10 @@ Orchestra sends nothing anywhere. The plugin directory asks each plugin to list 
 
 It adds one command, `/orchestra` (the plugin is session-orchestra; the command keeps the short name). It runs no slash commands, submits no prompts, and makes no network or MCP calls.
 
+## Privacy
+
+It reads only files on your machine and sends nothing. The full statement: [Privacy](https://github.com/atarazevich/session-orchestra/blob/main/PRIVACY.md).
+
 ## Requirements and limits
 
 - Claude Code **2.1.289** or newer, in a terminal. It is built on Claude Code's plugin API for function hooks, which is early access and may change between releases.
