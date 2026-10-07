@@ -25,6 +25,7 @@ const filter = atom({ plugin: 'session-orchestra', key: 'filter' } as const, '')
 const heard = atom({ plugin: 'session-orchestra', key: 'heard' } as const, { names: [], count: 0 })
 const paneUp = atom({ plugin: 'session-orchestra', key: 'paneUp' } as const, false)
 const selfName = atom({ plugin: 'session-orchestra', key: 'selfName' } as const, '')
+const reading = atom({ plugin: 'session-orchestra', key: 'reading' } as const, false)
 
 const ACCENT = '#E8875B'
 const HUB = '#6FC3DF'
@@ -429,23 +430,36 @@ async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'mi
   history = []
   live = { offset: 0, lines: [] }
   watching = { transcript, sessionId, isOwn }
+  await update($, reading, () => true)
   const found = await registry($)
   const own = found.find(s => s.sessionId === sessionId)?.name
-  const nameOf = await namer($, found)
-  const earlier: BusLine[] = []
-  const chain = await chainOf($, transcript)
-  for (const file of chain.slice(0, -1)) {
-    const got = await readFrom($, file, 0)
-    earlier.push(...parseBus(got.text, nameOf))
-  }
+  await update($, selfName, () => (!isOwn && own) || 'this chat')
   // switched again meanwhile: that switch owns the watch
   if (my !== generation) return 'superseded'
-  history = earlier
-  await update($, selfName, () => (!isOwn && own) || 'this chat')
-  if (my !== generation) return 'superseded'
+  // The current transcript first, so the pane fills at once; a compacted session's earlier ones join behind it.
   timer = $.clock.every(POLL_MS, () => poll($))
   await poll($)
-  return my === generation ? 'on' : 'superseded'
+  if (my !== generation) return 'superseded'
+  void readEarlier($, transcript, found, my).catch(() => {})
+  return 'on'
+}
+
+// The transcripts a compacted session left behind, read once, oldest first.
+async function readEarlier($: EngineInterface, transcript: string, found: Registered[], my: number) {
+  try {
+    const nameOf = await namer($, found)
+    const chain = await chainOf($, transcript)
+    const earlier: BusLine[] = []
+    for (const file of chain.slice(0, -1)) {
+      const got = await readFrom($, file, 0)
+      earlier.push(...parseBus(got.text, nameOf))
+    }
+    if (my !== generation) return
+    history = earlier
+    if (earlier.length) await poll($)
+  } finally {
+    if (my === generation) await update($, reading, () => false)
+  }
 }
 
 export const register: Register = on => {
@@ -530,6 +544,7 @@ export const register: Register = on => {
     if (verb === 'off') {
       watching = null
       generation++
+      await update($, reading, () => false)
       timer?.cancel()
       timer = null
       await $.store.delete(`on:${own}`)
@@ -543,6 +558,7 @@ export const register: Register = on => {
       timer = null
       generation++
       watching = { transcript: '', sessionId: DEMO, isOwn: true }
+      await update($, reading, () => false)
       const demo = demoData(await $.clock.now())
       await update($, sessions, () => demo.sessions)
       await update($, bus, () => demo.bus)
@@ -597,6 +613,7 @@ export const register: Register = on => {
     const views = await read($, sessions)
     const lines = await read($, bus)
     const self = await read($, selfName)
+    const isReading = await read($, reading)
     const working = views.filter(v => v.status === 'working').length
     const label = (who: string) => (who === YOU ? 'you' : who === SELF ? self || 'this chat' : who)
     const colorOf = (who: string) => (who === YOU ? BOSS : who === SELF ? HUB : ACCENT)
@@ -741,7 +758,7 @@ export const register: Register = on => {
       <Box flexDirection="column" height={sessionRows}>
         {header('Sessions', countsText, sessionsRight)}
         {open.length === 0 ? (
-          <Text dimColor>None open. A session shows here once this chat messages it or hears from it.</Text>
+          <Text dimColor>{isReading ? 'Reading the transcripts…' : 'None open. A session shows here once this chat messages it or hears from it.'}</Text>
         ) : perPage ? (
           Array.from({ length: Math.ceil(shownViews.length / 2) }, (_, r) => (
             <Box key={`row${r}`} flexDirection="row">
@@ -848,7 +865,7 @@ export const register: Register = on => {
         {spacer('gap1')}
         {header(
           'Messages',
-          only ? `${listed.length} with ${only}` : `${lines.length}`,
+          `${only ? `${listed.length} with ${only}` : `${lines.length}`}${isReading ? ' · reading earlier…' : ''}`,
           only ? (
             <Button key="all" onPress={() => pick(only)}>all</Button>
           ) : back > 0 ? (
@@ -858,7 +875,7 @@ export const register: Register = on => {
           ),
         )}
         <Box flexDirection="column" height={logRows} overflow="hidden">
-          {listed.length === 0 && <Text dimColor>Quiet so far.</Text>}
+          {listed.length === 0 && <Text dimColor>{isReading ? 'Reading…' : 'Quiet so far.'}</Text>}
           {list}
         </Box>
         {spacer('gap2')}

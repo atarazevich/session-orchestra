@@ -33,6 +33,8 @@ declare module 'claude-code' {
       heard: { names: string[]; count: number }
       // The watched session's own name, for its messages' labels.
       selfName: string
+      // While the transcripts are still being read, so an empty pane says so instead of showing zeros.
+      reading: boolean
     }
   }
 }
