@@ -237,7 +237,13 @@ async function backfill($: EngineInterface): Promise<BusLine[]> {
     }
   }
   for (const m of api) {
-    const text = typeof m.content === 'string' ? m.content : m.content.map(b => (b.type === 'text' ? b.text : '')).join('\n')
+    // a message that arrived mid-turn rides inside a tool result
+    const textOf = (c: unknown): string =>
+      typeof c === 'string' ? c
+      : Array.isArray(c) ? c.map(textOf).join('\n')
+      : c && typeof c === 'object' ? textOf((c as { text?: unknown; content?: unknown }).text ?? (c as { content?: unknown }).content)
+      : ''
+    const text = textOf(m.content)
     if (m.role === 'user') for (const p of text.matchAll(ENVELOPE)) lines.push(line(ts++, p[1] ?? '?', SELF, p[2] ?? ''))
   }
   return lines.filter(l => l.text !== '/compact').slice(-KEEP)
@@ -523,6 +529,13 @@ export const register: Register = on => {
       await update($, logBack, () => 0)
       await openPane($)
       return { text: 'Orchestra shows made-up sessions. /orchestra on goes back to this session.' }
+    }
+    // Probe for #2: rebuild this session's journal from what the session holds.
+    if (verb === 'backfill') {
+      journal = { lines: await backfill($) }
+      await saveJournal($)
+      const peers = journal.lines.filter(l => l.to === SELF && l.from !== YOU).length
+      return { text: `Journal rebuilt: ${journal.lines.length} lines, ${peers} from peers.` }
     }
     if (verb === 'on') {
       const target = arg || own
