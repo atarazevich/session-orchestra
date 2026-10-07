@@ -252,7 +252,14 @@ async function backfill($: EngineInterface): Promise<BusLine[]> {
 // Opens this session's own journal, from its file or, the first time, from what the session holds.
 async function openJournal($: EngineInterface) {
   journal = (await readJournal($, await $.session.id())) ?? { lines: await backfill($) }
-  meta = { ...meta, pane: (await $.env.get('HERDR_PANE_ID')) ?? null }
+  const kept = await readMeta($, await $.session.id())
+  meta = {
+    ...meta,
+    ...kept,
+    pane: (await $.env.get('HERDR_PANE_ID')) ?? null,
+    model: await $.session.model(),
+    ctx: (await $.session.usage()).context.percent ?? kept?.ctx ?? null,
+  }
   await saveJournal($)
   await saveMeta($)
 }
