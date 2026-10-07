@@ -237,7 +237,7 @@ async function backfill($: EngineInterface): Promise<BusLine[]> {
     }
   }
   for (const m of api) {
-    const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    const text = typeof m.content === 'string' ? m.content : m.content.map(b => (b.type === 'text' ? b.text : '')).join('\n')
     if (m.role === 'user') for (const p of text.matchAll(ENVELOPE)) lines.push(line(ts++, p[1] ?? '?', SELF, p[2] ?? ''))
   }
   return lines.filter(l => l.text !== '/compact').slice(-KEEP)
