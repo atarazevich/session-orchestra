@@ -24,6 +24,8 @@ async function probe($: EngineInterface, args: string) {
   out.toolUses = uses.reduce<Record<string, number>>((a, u) => ((a[u.tool] = (a[u.tool] ?? 0) + 1), a), {})
   out.sendTo = uses.filter(u => u.tool === 'SendMessage').map(u => ({ to: u.input.to, inputKeys: Object.keys(u.input), resultKeys: u.result && typeof u.result === 'object' ? Object.keys(u.result) : typeof u.result }))
   // user rows that are plain prompts vs other
+  // test sessions only: the probe panes' own text
+  out.userRowsHead = msgs.filter(m => m.role === 'user' && m.text).map(m => m.text.slice(0, 60))
   out.userTextRows = msgs.filter(m => m.role === 'user' && m.text).length
   out.userToolResultRows = msgs.filter(m => m.role === 'user' && m.toolResults?.length).length
   // api form: are there timestamps anywhere?
@@ -33,6 +35,7 @@ async function probe($: EngineInterface, args: string) {
   out.apiHasTimestamp = JSON.stringify(api).includes('"timestamp"')
   out.apiPeerEnvelopes = api.filter(m => JSON.stringify(m.content).includes('cross-session-message')).length
   out.apiQueuedHint = api.filter(m => JSON.stringify(m.content).includes('queued')).length
+  out.apiUserHead = api.filter(m => m.role === 'user').map(m => (typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => (b as { text: string }).text).join('|')).slice(0, 80)).filter(Boolean)
   // own details without programs
   out.model = await $.session.model()
   out.step = step
