@@ -4,7 +4,9 @@
 
 When one session hands work to others (a lead and its teams, a planner and its workers), they talk through `SendMessage`. Those messages end up scattered through each session's transcript. Orchestra reads them back and draws them in one place: which sessions this chat talks to, how each is doing, every message between them, and the one you pick, in full.
 
-![orchestra: sessions, messages and the picked message](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/demo.png)
+![session-orchestra in a real session](https://raw.githubusercontent.com/atarazevich/session-orchestra/main/docs/real.png)
+
+*A real session: this chat directs four others.*
 
 ## What it is, and what it is not
 
