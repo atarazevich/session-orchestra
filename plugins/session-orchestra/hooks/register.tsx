@@ -7,8 +7,6 @@ import type { LogRow as DrawnRow } from './log'
 
 const PANE = 'orchestra'
 const POLL_MS = 15_000
-const CHUNK_BYTES = 3_000_000 // under $.process.run's 4 MiB output cap
-const OUTPUT_CAP = 4_194_304 // what $.process.run keeps of a program's output
 const KEEP = 1000
 const MAX_SESSIONS = 24
 const DEMO = 'demo'
@@ -51,19 +49,6 @@ const STATE: Record<SessionView['status'], { glyph: string; word: string; color:
 
 // One live session as Claude Code records it in ~/.claude/sessions/<pid>.json.
 type Registered = { sessionId: string; cwd: string; name: string; status: string; messagingSocketPath?: string }
-type Row = {
-  type?: string
-  timestamp?: string
-  isMeta?: boolean
-  effort?: string
-  attachment?: { type?: string; prompt?: string }
-  message?: {
-    model?: string
-    usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
-    content?: string | { type: string; text?: string; name?: string; input?: Record<string, unknown> }[]
-  }
-}
-
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
 const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim()
 const hhmm = (ts: number) => new Date(ts).toTimeString().slice(0, 5)
@@ -136,9 +121,9 @@ function wrap(text: string, width: number): string[] {
 }
 
 // Which session this one watches. Unset: the mode is off here.
-let watching: { transcript: string; sessionId: string; isOwn: boolean } | null = null
+let watching: { sessionId: string; isOwn: boolean } | null = null
 let timer: { cancel: () => void } | null = null
-// Bumped on every switch; a poll or a history read started before it writes nothing.
+// Bumped on every switch; a poll started before it writes nothing.
 let generation = 0
 // The generation whose poll is running, so polls never overlap.
 let polling = -1
@@ -146,14 +131,52 @@ let polling = -1
 let again = -1
 // Last drawn geometry, for the scroll hook to tell the log from the reader.
 let geometry = { readerTop: Infinity, maxBack: 0, maxReader: 0 }
-// Earlier transcripts are read once (null until then); the live one from where the last poll stopped.
-let history: BusLine[] | null = null
-let live = { offset: 0, lines: [] as BusLine[] }
-// A session's model, effort and context, kept until it works again.
-const details = new Map<string, Pick<SessionView, 'model' | 'effort' | 'ctx'>>()
+
+// No programs: every session that runs this plugin keeps its own journal, and an orchestrator reads
+// the journals. ~/.claude/session-orchestra/<sessionId>.json holds the messages (raw addresses, named
+// when read); <sessionId>.meta.json the session's herdr pane, model, effort and context, kept small
+// so a poll can read every live session's. Each file has one writer: its own session.
+type Journal = { lines: BusLine[] }
+type Meta = { pane: string | null; model: string | null; effort: string | null; ctx: number | null; updatedAt: number }
+const JOURNAL_BYTES = 3_500_000 // under $.fs's 4 MiB read and write limit
+let journal: Journal | null = null
+let meta: Meta = { pane: null, model: null, effort: null, ctx: null, updatedAt: 0 }
+// Writes in order, one at a time.
+let writing: Promise<unknown> = Promise.resolve()
 
 async function home($: EngineInterface) {
   return (await $.env.get('HOME')) ?? '~'
+}
+const dirOf = async ($: EngineInterface) => `${await home($)}/.claude/session-orchestra`
+
+async function readJson<T>($: EngineInterface, path: string): Promise<T | null> {
+  try {
+    return JSON.parse(await $.fs.read(path)) as T
+  } catch {
+    return null
+  }
+}
+const readJournal = async ($: EngineInterface, id: string) => readJson<Journal>($, `${await dirOf($)}/${id}.json`)
+const readMeta = async ($: EngineInterface, id: string) => readJson<Meta>($, `${await dirOf($)}/${id}.meta.json`)
+
+async function saveJournal($: EngineInterface) {
+  const j = journal
+  if (!j) return
+  let text = JSON.stringify(j)
+  while (new TextEncoder().encode(text).length > JOURNAL_BYTES && j.lines.length > 1) {
+    j.lines = j.lines.slice(Math.ceil(j.lines.length / 4))
+    text = JSON.stringify(j)
+  }
+  const path = `${await dirOf($)}/${await $.session.id()}.json`
+  writing = writing.then(() => $.fs.write(path, text)).catch(() => {})
+  await writing
+}
+async function saveMeta($: EngineInterface) {
+  meta = { ...meta, updatedAt: await $.clock.now() }
+  const path = `${await dirOf($)}/${await $.session.id()}.meta.json`
+  const text = JSON.stringify(meta)
+  writing = writing.then(() => $.fs.write(path, text)).catch(() => {})
+  await writing
 }
 
 async function registry($: EngineInterface): Promise<Registered[]> {
@@ -175,34 +198,15 @@ async function registry($: EngineInterface): Promise<Registered[]> {
   return found
 }
 
-// herdr's panes by id, when herdr runs here; `herdr agent prompt <pane>` names its target that way.
-async function herdrPanes($: EngineInterface): Promise<Record<string, string>> {
-  try {
-    const listed = await $.process.run(['herdr', 'agent', 'list'], { timeoutMs: 5_000 })
-    if (listed.exitCode !== 0) return {}
-    const agents: { pane_id: string; terminal_title_stripped: string }[] = JSON.parse(listed.stdout).result.agents
-    return Object.fromEntries(agents.map(a => [a.pane_id, plainTitle(a.terminal_title_stripped)]))
-  } catch {
-    return {}
-  }
-}
-
-// Names an address the way the live sessions call themselves: a socket through the registry, a herdr pane by its title.
-async function namer($: EngineInterface, found: Registered[]) {
-  const panes = await herdrPanes($)
-  return (address: string) => {
-    if (address.startsWith('uds:')) return found.find(s => s.messagingSocketPath === address.slice(4))?.name ?? address
-    if (address.startsWith('herdr:')) return panes[address.slice(6)] ?? address.slice(6)
-    return address
-  }
-}
-
 // FNV-1a of the full text, so two messages that start alike keep apart ids.
 const hash = (s: string) => {
   let x = 0x811c9dc5
   for (let i = 0; i < s.length; i++) x = Math.imul(x ^ s.charCodeAt(i), 0x01000193)
   return (x >>> 0).toString(36)
 }
+const line = (ts: number, from: string, to: string, text: string): BusLine => ({ id: `${ts}|${from}|${to}|${hash(text)}`, ts, from, to, text: text.trim() })
+const HERDR_PROMPT = /herdr agent prompt (w\d+:p\w+) "((?:[^"\\]|\\.)*)"/g
+const ENVELOPE = /<cross-session-message[^>]*from-name="([^"]+)"[^>]*>([\s\S]*?)<\/cross-session-message>/g
 
 // The same message from and to the same sessions within 2 minutes shows once.
 function dedupe(lines: BusLine[]): BusLine[] {
@@ -216,132 +220,54 @@ function dedupe(lines: BusLine[]): BusLine[] {
   })
 }
 
-function parseBus(jsonl: string, nameOf: (address: string) => string): BusLine[] {
+// A first start with the plugin: what the session already holds. Rows carry no time, so the lines are
+// stamped in order from the session's start; peers' messages are only in the API form, after the rest.
+async function backfill($: EngineInterface): Promise<BusLine[]> {
+  const rows = await $.session.messages()
+  const api = await $.session.messages({ as: 'api' })
+  let ts = (await $.session.usage()).startedAt
   const lines: BusLine[] = []
-  const push = (ts: number, from: string, to: string, text: string) => {
-    lines.push({ id: `${ts}|${from}|${to}|${hash(text)}`, ts, from, to, text: text.trim() })
-  }
-
-  for (const raw of jsonl.split('\n')) {
-    let row: Row
-    try {
-      row = JSON.parse(raw)
-    } catch {
-      continue
-    }
-    const ts = Date.parse(row.timestamp ?? '')
-    if (Number.isNaN(ts)) continue
-    // A prompt or a session's message: its own user row when the session was idle (a session's
-    // message is stored isMeta), a queued_command attachment when it arrived mid-turn.
-    const queued = row.type === 'attachment' && row.attachment?.type === 'queued_command' ? row.attachment.prompt : undefined
-    const content = row.message?.content
-    const said =
-      queued ??
-      (row.type !== 'user' || content === undefined ? undefined
-        : typeof content === 'string' ? content
-        : content.some(b => b.type === 'tool_result') ? undefined
-        : content.find(b => b.type === 'text')?.text)
-    if (said !== undefined) {
-      const peer = /<cross-session-message[^>]*from-name="([^"]+)"[^>]*>([\s\S]*?)<\/cross-session-message>/.exec(said)
-      if (peer) push(ts, nameOf(peer[1] ?? '?'), SELF, peer[2] ?? '')
-      else if ((queued !== undefined || !row.isMeta) && !/^\s*</.test(said) && !said.startsWith('This session is being continued'))
-        push(ts, YOU, SELF, said)
-    }
-
-    if (row.type !== 'assistant' || content === undefined || typeof content === 'string') continue
-    for (const block of content) {
-      if (block.type !== 'tool_use') continue
-      const input = block.input ?? {}
-      if (block.name === 'SendMessage' && typeof input.to === 'string')
-        push(ts, SELF, nameOf(input.to), String(input.message ?? ''))
-      if (block.name === 'Bash' && typeof input.command === 'string') {
-        for (const m of input.command.matchAll(/herdr agent prompt (w\d+:p\w+) "((?:[^"\\]|\\.)*)"/g)) {
-          const text = (m[2] ?? '').replace(/\\"/g, '"')
-          if (text !== '/compact') push(ts, SELF, nameOf(`herdr:${m[1] ?? ''}`), text)
-        }
-      }
+  for (const row of rows) {
+    if (row.role === 'user' && row.text && !row.toolResults?.length && !/^\s*</.test(row.text) && !row.text.startsWith('This session is being continued'))
+      lines.push(line(ts++, YOU, SELF, row.text))
+    for (const use of row.toolUses) {
+      if (use.tool === 'SendMessage' && typeof use.input.to === 'string') lines.push(line(ts++, SELF, use.input.to, String(use.input.message ?? '')))
+      if (use.tool === 'Bash' && typeof use.input.command === 'string')
+        for (const m of use.input.command.matchAll(HERDR_PROMPT)) lines.push(line(ts++, SELF, `herdr:${m[1] ?? ''}`, (m[2] ?? '').replace(/\\"/g, '"')))
     }
   }
-  return lines
+  for (const m of api) {
+    const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    if (m.role === 'user') for (const p of text.matchAll(ENVELOPE)) lines.push(line(ts++, p[1] ?? '?', SELF, p[2] ?? ''))
+  }
+  return lines.filter(l => l.text !== '/compact').slice(-KEEP)
 }
 
-// Reads a file from a byte offset to its last complete line; answers the text and the new offset.
-// $.process.run keeps the first OUTPUT_CAP bytes of what a program writes, so a long file takes several reads.
-async function readFrom($: EngineInterface, file: string, offset: number) {
-  let text = ''
-  // Inside a line longer than one read: its rest, up to the next newline, is dropped.
-  let skipping = false
-  for (;;) {
-    // a read that times out rejects: keep what was read so far
-    const out = await $.process.run(['tail', '-c', `+${offset + 1}`, file], { timeoutMs: 20_000 }).catch(() => null)
-    if (!out || out.exitCode !== 0) break
-    const cut = out.stdout.lastIndexOf('\n') + 1
-    if (cut === 0) {
-      if (!out.isStdoutTruncated) break
-      // a full read of one long line: step past its bytes
-      offset += OUTPUT_CAP
-      skipping = true
-      continue
-    }
-    const whole = out.stdout.slice(0, cut)
-    text += skipping ? whole.slice(whole.indexOf('\n') + 1) : whole
-    skipping = false
-    // whole lines of UTF-8 encode back to exactly the bytes they were read from
-    offset += new TextEncoder().encode(whole).length
-    if (!out.isStdoutTruncated) break
-  }
-  return { text, offset }
+// Opens this session's own journal, from its file or, the first time, from what the session holds.
+async function openJournal($: EngineInterface) {
+  journal = (await readJournal($, await $.session.id())) ?? { lines: await backfill($) }
+  meta = { ...meta, pane: (await $.env.get('HERDR_PANE_ID')) ?? null }
+  await saveJournal($)
+  await saveMeta($)
 }
 
-// A compacted session goes on in a new transcript; its summary names the one before.
-async function chainOf($: EngineInterface, file: string) {
-  const chain = [file]
-  for (let oldest = file; chain.length < 6; ) {
-    // a read that times out ends the chain where it is
-    const head = await $.process.run(['head', '-c', '400000', oldest]).catch(() => null)
-    const before = head && /read the full transcript at: (\/[^\s"\\]+\.jsonl)/.exec(head.stdout)?.[1]
-    if (!before || chain.includes(before)) break
-    chain.unshift(before)
-    oldest = before
-  }
-  return chain
+// One message of this session, as it happens.
+async function record($: EngineInterface, from: string, to: string, text: string) {
+  if (!journal || text.trim() === '' || text.trim() === '/compact') return
+  journal.lines = [...journal.lines, line(await $.clock.now(), from, to, text)].slice(-KEEP)
+  await saveJournal($)
+  if (from !== YOU) await hear($, from === SELF ? to : from)
+  if (watching?.isOwn) void poll($)
 }
 
-// A session's transcript sits under its folder, spelled the way Claude Code spells project folders.
-const transcriptPath = (root: string, s: Registered) =>
-  `${root}/.claude/projects/${s.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${s.sessionId}.jsonl`
-
-// claude-<family>-<major>… or claude-<major>-…-<family>…: 200k for Haiku and up to major 4, 1M after.
-const contextWindow = (id: string) => {
-  const major = /claude-(?:[a-z]+-)?(\d+)/.exec(id)?.[1]
-  return major && (id.includes('haiku') || Number(major) <= 4) ? 200_000 : 1_000_000
-}
-
-// Model, effort and context of a session's last reply, from its transcript's tail.
-async function detailOf($: EngineInterface, root: string, s: Registered) {
-  // a read that times out leaves the session's last known detail
-  const tail = await $.process.run(['tail', '-c', '300000', transcriptPath(root, s)], { timeoutMs: 5_000 }).catch(() => null)
-  if (!tail) return null
-  const out: Pick<SessionView, 'model' | 'effort' | 'ctx'> = { model: null, effort: null, ctx: null }
-  for (const raw of tail.stdout.split('\n').reverse()) {
-    if (out.model && out.effort) break
-    if (!raw.includes('"usage"') && !raw.includes('"effort"')) continue
-    let row: Row
-    try {
-      row = JSON.parse(raw)
-    } catch {
-      continue
-    }
-    if (!out.effort && row.effort) out.effort = row.effort
-    const usage = row.message?.usage
-    if (!out.model && row.type === 'assistant' && row.message?.model && usage) {
-      const used = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
-      const window = contextWindow(row.message.model)
-      out.model = modelName(row.message.model)
-      out.ctx = Math.round((used * 100) / window)
-    }
+// Names an address the way the live sessions call themselves: a socket through the registry, a herdr
+// pane through the pane the session there wrote in its meta.
+function namer(found: Registered[], panes: Record<string, string>) {
+  return (address: string) => {
+    if (address.startsWith('uds:')) return found.find(s => s.messagingSocketPath === address.slice(4))?.name ?? address
+    if (address.startsWith('herdr:')) return panes[address.slice(6)] ?? address.slice(6)
+    return address
   }
-  return out
 }
 
 const isAgentId = (who: string) => /^a[0-9a-f]{15,}$/.test(who)
@@ -357,29 +283,32 @@ async function poll($: EngineInterface) {
   }
   polling = my
   try {
-    const root = await home($)
     const found = await registry($)
-    const nameOf = await namer($, found)
-
-    const { text, offset } = await readFrom($, w.transcript, live.offset)
-    if (my !== generation) return
-    live = { offset, lines: [...live.lines, ...parseBus(text, nameOf)].slice(-KEEP) }
-    const hasHistory = history !== null
-    const lines = dedupe([...(history ?? []), ...live.lines]).slice(-KEEP)
+    const metas = new Map<string, Meta>()
+    for (const s of found) {
+      const m = await readMeta($, s.sessionId)
+      if (m) metas.set(s.sessionId, m)
+    }
+    const panes: Record<string, string> = {}
+    for (const s of found) {
+      const pane = metas.get(s.sessionId)?.pane
+      if (pane) panes[pane] = s.name
+    }
+    const nameOf = namer(found, panes)
+    const watched = w.isOwn ? journal : await readJournal($, w.sessionId)
+    if (my !== generation || !watched) return
+    const lines = dedupe(watched.lines.map(l => ({ ...l, from: nameOf(l.from), to: nameOf(l.to) }))).slice(-KEEP)
 
     // The sessions this chat has talked to, the latest first.
     const lastTs = new Map<string, number>()
     for (const l of lines) for (const who of [l.from, l.to]) if (who !== YOU && who !== SELF && !isAgentId(who)) lastTs.set(who, l.ts)
     const names = [...lastTs.keys()].sort((a, b) => (lastTs.get(b) ?? 0) - (lastTs.get(a) ?? 0)).slice(0, MAX_SESSIONS)
-    const views: SessionView[] = []
-    for (const name of names) {
+    const views: SessionView[] = names.map(name => {
       const s = found.find(r => r.name === name && r.sessionId !== w.sessionId)
       const status: SessionView['status'] = !s ? 'closed' : s.status === 'busy' ? 'working' : 'idle'
-      const fresh = s && (status === 'working' || !details.has(s.sessionId)) ? await detailOf($, root, s) : null
-      if (s && fresh) details.set(s.sessionId, fresh)
-      const detail = (s && details.get(s.sessionId)) || { model: null, effort: null, ctx: null }
-      views.push({ name, status, folder: s ? baseName(s.cwd) : null, ...detail })
-    }
+      const m = s && metas.get(s.sessionId)
+      return { name, status, folder: s ? baseName(s.cwd) : null, model: m?.model ? modelName(m.model) : null, effort: m?.effort ?? null, ctx: m?.ctx ?? null }
+    })
     if (my !== generation) return
     await update($, sessions, () => views)
 
@@ -394,8 +323,7 @@ async function poll($: EngineInterface) {
     const added = withDays(listed).length - withDays(listed.filter(l => l.ts <= newest)).length
     if (my !== generation) return
     if (newest > 0 && added > 0 && back > 0) await update($, logBack, n => n + added)
-    // the first list that holds the earlier transcripts ends the reading
-    if (hasHistory && (await read($, reading))) await update($, reading, () => false)
+    if (await read($, reading)) await update($, reading, () => false)
   } catch {
     // the next poll tries again
   } finally {
@@ -415,13 +343,9 @@ async function hear($: EngineInterface, who: string) {
   await update($, heard, was => ({ names: was.names.includes(who) ? was.names : [...was.names, who], count: was.count + 1 }))
 }
 
-// On start with the mode off: what this session's transcript already holds.
+// On start with the mode off: what this session's journal already holds.
 async function scanOwn($: EngineInterface) {
-  const transcript = await transcriptOf($, await $.session.id())
-  if (!transcript) return
-  // the last 3 MB is enough to know whether this chat talks to other sessions
-  const tail = await $.process.run(['tail', '-c', String(CHUNK_BYTES), transcript], { timeoutMs: 10_000 })
-  const lines = dedupe(parseBus(tail.stdout, a => a)).filter(l => l.from !== YOU)
+  const lines = dedupe(journal?.lines ?? []).filter(l => l.from !== YOU)
   const names = [...new Set(lines.flatMap(l => [l.from, l.to]))].filter(n => n !== YOU && n !== SELF && !isAgentId(n) && !n.startsWith('herdr:'))
   await update($, heard, () => ({ names, count: lines.length }))
 }
@@ -433,39 +357,26 @@ async function openPane($: EngineInterface) {
   return opened
 }
 
-async function transcriptOf($: EngineInterface, sessionId: string): Promise<string | null> {
-  const found = await $.process.run(['find', `${await home($)}/.claude/projects`, '-maxdepth', '2', '-name', `${sessionId}.jsonl`])
-  return found.stdout.split('\n')[0]?.trim() || null
-}
-
+// 'missing': another session that keeps no journal (it does not run this plugin).
 // 'superseded': a later switch, demo or off took over meanwhile, and the caller does nothing.
 async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'missing' | 'superseded'> {
   const entry = generation
   const isOwn = sessionId === (await $.session.id())
-  const transcript = await transcriptOf($, sessionId)
-  // an off, demo or switch made while the transcript was looked up wins
+  const exists = isOwn || (await $.fs.exists(`${await dirOf($)}/${sessionId}.json`))
   if (entry !== generation) return 'superseded'
-  if (!transcript) return 'missing'
-  // Stop the old watch before the new one starts, so nothing reads the new transcript from the old offset.
+  if (!exists) return 'missing'
   timer?.cancel()
   timer = null
   const my = ++generation
-  history = null
-  live = { offset: 0, lines: [] }
-  watching = { transcript, sessionId, isOwn }
+  watching = { sessionId, isOwn }
   try {
     await update($, reading, () => true)
-    const found = await registry($)
-    const own = found.find(s => s.sessionId === sessionId)?.name
+    const own = (await registry($)).find(s => s.sessionId === sessionId)?.name
     await update($, selfName, () => (!isOwn && own) || 'this chat')
-    // switched again meanwhile: that switch owns the watch
     if (my !== generation) return 'superseded'
-    // The current transcript first, so the pane fills at once; a compacted session's earlier ones join behind it.
     timer = $.clock.every(POLL_MS, () => poll($))
     await poll($)
-    if (my !== generation) return 'superseded'
-    void readEarlier($, transcript, found, my)
-    return 'on'
+    return my !== generation ? 'superseded' : 'on'
   } catch (err) {
     // a failed start leaves no watch and no "Reading…" behind, so the next try starts afresh
     if (my === generation) {
@@ -478,21 +389,6 @@ async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'mi
   }
 }
 
-// The transcripts a compacted session left behind, read once, oldest first.
-// None of its reads reject, and the poll that lists them ends the reading.
-async function readEarlier($: EngineInterface, transcript: string, found: Registered[], my: number) {
-  const nameOf = await namer($, found)
-  const chain = await chainOf($, transcript)
-  const earlier: BusLine[] = []
-  for (const file of chain.slice(0, -1)) {
-    const got = await readFrom($, file, 0)
-    earlier.push(...parseBus(got.text, nameOf))
-  }
-  if (my !== generation) return
-  history = earlier
-  await poll($)
-}
-
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -501,8 +397,8 @@ export const register: Register = on => {
     }).catch(() => {
       // the session starts all the same
     })
-    // In the background, so the full history read never holds up the first prompt.
     void (async () => {
+      await openJournal($)
       const own = await $.session.id()
       const target = await $.store.get(`on:${own}`)
       const state = typeof target === 'string' ? await turnOn($, target) : 'missing'
@@ -515,18 +411,43 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // With the mode off, every message to or from another session counts toward the hint.
-  on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
-    const to = (e as unknown as { to?: unknown }).to
-    if (typeof to === 'string') await hear($, to)
+  // The journal: every message of this session as it happens, from the engine's own events.
+  on('session.send', async ($, e, next) => {
+    if (e.agentId === undefined) await record($, SELF, e.to, e.text).catch(() => {})
+    return next(e)
+  })
+  on('session.receive', async ($, e, next) => {
+    if (e.agentId === undefined && e.origin.kind === 'peer')
+      for (const m of e.text.matchAll(ENVELOPE)) await record($, m[1] ?? '?', SELF, m[2] ?? '').catch(() => {})
     return next(e)
   })
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'peer' || e.origin.kind === 'peer-send-message') {
-      const from = /from-name="([^"]+)"/.exec(e.text)?.[1]
-      if (from) await hear($, from)
-    }
+    if ((e.origin.kind === 'composer' || e.origin.kind === 'bridge') && !e.text.startsWith('/'))
+      await record($, YOU, SELF, e.text).catch(() => {})
     return next(e)
+  })
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (e.agentId === undefined)
+      for (const m of e.command.matchAll(HERDR_PROMPT))
+        await record($, SELF, `herdr:${m[1] ?? ''}`, (m[2] ?? '').replace(/\\"/g, '"')).catch(() => {})
+    return next(e)
+  })
+  // This session's model and effort as each request goes out, its context once the turn ends.
+  on('turn.step', async function* ($, e, next) {
+    const effort = e.effort === undefined ? null : String(e.effort)
+    if (e.agentId === undefined && (meta.model !== e.model || meta.effort !== effort)) {
+      meta = { ...meta, model: e.model, effort }
+      await saveMeta($).catch(() => {})
+    }
+    return yield* next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined) {
+      meta = { ...meta, ctx: (await $.session.usage()).context.percent ?? null }
+      await saveMeta($).catch(() => {})
+    }
+    return result
   })
 
   // The person closing the pane (its ✕, Esc) reaches this hook; the hint line reads the result.
@@ -590,7 +511,7 @@ export const register: Register = on => {
       timer?.cancel()
       timer = null
       generation++
-      watching = { transcript: '', sessionId: DEMO, isOwn: true }
+      watching = { sessionId: DEMO, isOwn: true }
       await update($, reading, () => false)
       const demo = demoData(await $.clock.now())
       await update($, sessions, () => demo.sessions)
@@ -607,7 +528,7 @@ export const register: Register = on => {
       const target = arg || own
       const state = await turnOn($, target).catch(() => null)
       if (!state) return { text: `Orchestra could not turn on for session ${target}. Try /orchestra on again.` }
-      if (state === 'missing') return { text: `No transcript found for session ${target}.` }
+      if (state === 'missing') return { text: `Session ${target} keeps no orchestra journal: it does not run this plugin.` }
       if (state === 'superseded') return { text: 'A later /orchestra took over.' }
       await $.store.set(`on:${own}`, target)
       await openPane($)
@@ -791,7 +712,7 @@ export const register: Register = on => {
       <Box flexDirection="column" height={sessionRows}>
         {header('Sessions', countsText, sessionsRight)}
         {open.length === 0 ? (
-          <Text dimColor>{isReading ? 'Reading the transcripts…' : 'None open. A session shows here once this chat messages it or hears from it.'}</Text>
+          <Text dimColor>{isReading ? 'Reading the journal…' : 'None open. A session shows here once this chat messages it or hears from it.'}</Text>
         ) : perPage ? (
           Array.from({ length: Math.ceil(shownViews.length / 2) }, (_, r) => (
             <Box key={`row${r}`} flexDirection="row">
