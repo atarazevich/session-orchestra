@@ -142,10 +142,12 @@ let timer: { cancel: () => void } | null = null
 let generation = 0
 // The generation whose poll is running, so polls never overlap.
 let polling = -1
+// The generation of a poll skipped while another ran: the running one runs once more when it ends.
+let again = -1
 // Last drawn geometry, for the scroll hook to tell the log from the reader.
 let geometry = { readerTop: Infinity, maxBack: 0, maxReader: 0 }
-// Earlier transcripts are read once; the live one from where the last poll stopped.
-let history: BusLine[] = []
+// Earlier transcripts are read once (null until then); the live one from where the last poll stopped.
+let history: BusLine[] | null = null
 let live = { offset: 0, lines: [] as BusLine[] }
 // A session's model, effort and context, kept until it works again.
 const details = new Map<string, Pick<SessionView, 'model' | 'effort' | 'ctx'>>()
@@ -270,8 +272,9 @@ async function readFrom($: EngineInterface, file: string, offset: number) {
   // Inside a line longer than one read: its rest, up to the next newline, is dropped.
   let skipping = false
   for (;;) {
-    const out = await $.process.run(['tail', '-c', `+${offset + 1}`, file], { timeoutMs: 20_000 })
-    if (out.exitCode !== 0) break
+    // a read that times out rejects: keep what was read so far
+    const out = await $.process.run(['tail', '-c', `+${offset + 1}`, file], { timeoutMs: 20_000 }).catch(() => null)
+    if (!out || out.exitCode !== 0) break
     const cut = out.stdout.lastIndexOf('\n') + 1
     if (cut === 0) {
       if (!out.isStdoutTruncated) break
@@ -294,8 +297,9 @@ async function readFrom($: EngineInterface, file: string, offset: number) {
 async function chainOf($: EngineInterface, file: string) {
   const chain = [file]
   for (let oldest = file; chain.length < 6; ) {
-    const head = await $.process.run(['head', '-c', '400000', oldest])
-    const before = /read the full transcript at: (\/[^\s"\\]+\.jsonl)/.exec(head.stdout)?.[1]
+    // a read that times out ends the chain where it is
+    const head = await $.process.run(['head', '-c', '400000', oldest]).catch(() => null)
+    const before = head && /read the full transcript at: (\/[^\s"\\]+\.jsonl)/.exec(head.stdout)?.[1]
     if (!before || chain.includes(before)) break
     chain.unshift(before)
     oldest = before
@@ -315,7 +319,9 @@ const contextWindow = (id: string) => {
 
 // Model, effort and context of a session's last reply, from its transcript's tail.
 async function detailOf($: EngineInterface, root: string, s: Registered) {
-  const tail = await $.process.run(['tail', '-c', '300000', transcriptPath(root, s)], { timeoutMs: 5_000 })
+  // a read that times out leaves the session's last known detail
+  const tail = await $.process.run(['tail', '-c', '300000', transcriptPath(root, s)], { timeoutMs: 5_000 }).catch(() => null)
+  if (!tail) return null
   const out: Pick<SessionView, 'model' | 'effort' | 'ctx'> = { model: null, effort: null, ctx: null }
   for (const raw of tail.stdout.split('\n').reverse()) {
     if (out.model && out.effort) break
@@ -344,7 +350,11 @@ const isAgentId = (who: string) => /^a[0-9a-f]{15,}$/.test(who)
 async function poll($: EngineInterface) {
   const w = watching
   const my = generation
-  if (!w || w.sessionId === DEMO || polling === my) return
+  if (!w || w.sessionId === DEMO) return
+  if (polling === my) {
+    again = my
+    return
+  }
   polling = my
   try {
     const root = await home($)
@@ -354,7 +364,8 @@ async function poll($: EngineInterface) {
     const { text, offset } = await readFrom($, w.transcript, live.offset)
     if (my !== generation) return
     live = { offset, lines: [...live.lines, ...parseBus(text, nameOf)].slice(-KEEP) }
-    const lines = dedupe([...history, ...live.lines]).slice(-KEEP)
+    const hasHistory = history !== null
+    const lines = dedupe([...(history ?? []), ...live.lines]).slice(-KEEP)
 
     // The sessions this chat has talked to, the latest first.
     const lastTs = new Map<string, number>()
@@ -364,7 +375,8 @@ async function poll($: EngineInterface) {
     for (const name of names) {
       const s = found.find(r => r.name === name && r.sessionId !== w.sessionId)
       const status: SessionView['status'] = !s ? 'closed' : s.status === 'busy' ? 'working' : 'idle'
-      if (s && (status === 'working' || !details.has(s.sessionId))) details.set(s.sessionId, await detailOf($, root, s))
+      const fresh = s && (status === 'working' || !details.has(s.sessionId)) ? await detailOf($, root, s) : null
+      if (s && fresh) details.set(s.sessionId, fresh)
       const detail = (s && details.get(s.sessionId)) || { model: null, effort: null, ctx: null }
       views.push({ name, status, folder: s ? baseName(s.cwd) : null, ...detail })
     }
@@ -382,10 +394,18 @@ async function poll($: EngineInterface) {
     const added = withDays(listed).length - withDays(listed.filter(l => l.ts <= newest)).length
     if (my !== generation) return
     if (newest > 0 && added > 0 && back > 0) await update($, logBack, n => n + added)
+    // the first list that holds the earlier transcripts ends the reading
+    if (hasHistory && (await read($, reading))) await update($, reading, () => false)
   } catch {
     // the next poll tries again
   } finally {
-    if (polling === my) polling = -1
+    if (polling === my) {
+      polling = -1
+      if (again === my) {
+        again = -1
+        await poll($)
+      }
+    }
   }
 }
 
@@ -420,46 +440,57 @@ async function transcriptOf($: EngineInterface, sessionId: string): Promise<stri
 
 // 'superseded': a later switch, demo or off took over meanwhile, and the caller does nothing.
 async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'missing' | 'superseded'> {
-  const transcript = await transcriptOf($, sessionId)
-  if (!transcript) return 'missing'
+  const entry = generation
   const isOwn = sessionId === (await $.session.id())
+  const transcript = await transcriptOf($, sessionId)
+  // an off, demo or switch made while the transcript was looked up wins
+  if (entry !== generation) return 'superseded'
+  if (!transcript) return 'missing'
   // Stop the old watch before the new one starts, so nothing reads the new transcript from the old offset.
   timer?.cancel()
   timer = null
   const my = ++generation
-  history = []
+  history = null
   live = { offset: 0, lines: [] }
   watching = { transcript, sessionId, isOwn }
-  await update($, reading, () => true)
-  const found = await registry($)
-  const own = found.find(s => s.sessionId === sessionId)?.name
-  await update($, selfName, () => (!isOwn && own) || 'this chat')
-  // switched again meanwhile: that switch owns the watch
-  if (my !== generation) return 'superseded'
-  // The current transcript first, so the pane fills at once; a compacted session's earlier ones join behind it.
-  timer = $.clock.every(POLL_MS, () => poll($))
-  await poll($)
-  if (my !== generation) return 'superseded'
-  void readEarlier($, transcript, found, my).catch(() => {})
-  return 'on'
+  try {
+    await update($, reading, () => true)
+    const found = await registry($)
+    const own = found.find(s => s.sessionId === sessionId)?.name
+    await update($, selfName, () => (!isOwn && own) || 'this chat')
+    // switched again meanwhile: that switch owns the watch
+    if (my !== generation) return 'superseded'
+    // The current transcript first, so the pane fills at once; a compacted session's earlier ones join behind it.
+    timer = $.clock.every(POLL_MS, () => poll($))
+    await poll($)
+    if (my !== generation) return 'superseded'
+    void readEarlier($, transcript, found, my)
+    return 'on'
+  } catch (err) {
+    // a failed start leaves no watch and no "Reading…" behind, so the next try starts afresh
+    if (my === generation) {
+      watching = null
+      timer?.cancel()
+      timer = null
+      await update($, reading, () => false)
+    }
+    throw err
+  }
 }
 
 // The transcripts a compacted session left behind, read once, oldest first.
+// None of its reads reject, and the poll that lists them ends the reading.
 async function readEarlier($: EngineInterface, transcript: string, found: Registered[], my: number) {
-  try {
-    const nameOf = await namer($, found)
-    const chain = await chainOf($, transcript)
-    const earlier: BusLine[] = []
-    for (const file of chain.slice(0, -1)) {
-      const got = await readFrom($, file, 0)
-      earlier.push(...parseBus(got.text, nameOf))
-    }
-    if (my !== generation) return
-    history = earlier
-    if (earlier.length) await poll($)
-  } finally {
-    if (my === generation) await update($, reading, () => false)
+  const nameOf = await namer($, found)
+  const chain = await chainOf($, transcript)
+  const earlier: BusLine[] = []
+  for (const file of chain.slice(0, -1)) {
+    const got = await readFrom($, file, 0)
+    earlier.push(...parseBus(got.text, nameOf))
   }
+  if (my !== generation) return
+  history = earlier
+  await poll($)
 }
 
 export const register: Register = on => {
@@ -467,6 +498,8 @@ export const register: Register = on => {
     await $.command.register({
       name: 'orchestra',
       description: 'Orchestrator view: on [session id] · off · (no argument) open the pane',
+    }).catch(() => {
+      // the session starts all the same
     })
     // In the background, so the full history read never holds up the first prompt.
     void (async () => {
@@ -865,7 +898,7 @@ export const register: Register = on => {
         {spacer('gap1')}
         {header(
           'Messages',
-          `${only ? `${listed.length} with ${only}` : `${lines.length}`}${isReading ? ' · reading earlier…' : ''}`,
+          `${only ? `${listed.length} with ${only}` : lines.length}${isReading ? ' · reading earlier…' : ''}`,
           only ? (
             <Button key="all" onPress={() => pick(only)}>all</Button>
           ) : back > 0 ? (

@@ -60,6 +60,16 @@ claude plugin install session-orchestra@session-orchestra
 
 Sessions already open pick it up after `/reload-plugins`.
 
+### Upgrading from `orchestra`
+
+The plugin was called `orchestra` before. Uninstall the old one first:
+
+```sh
+claude plugin uninstall orchestra@orchestra
+```
+
+Sessions that had it on come back with it off after the rename; run `/orchestra on` in them again.
+
 ## Use
 
 In the session whose conversations you want to see:
@@ -92,17 +102,23 @@ Orchestra sends nothing anywhere. The plugin directory asks each plugin to list 
 
 | Program | Why |
 |---|---|
-| `tail -c +<offset> <transcript>` | Reads a transcript from where it last stopped. The plugin API keeps only the first 4 MiB of a program's output, so a long transcript takes several reads. |
+| `tail -c +<offset+1> <transcript>` | Reads a transcript from where it last stopped. The plugin API keeps only the first 4 MiB of a program's output, so a long transcript takes several reads. |
 | `head -c 400000 <transcript>` | Reads the start of a transcript to find the earlier transcript a compacted session continues. |
 | `tail -c <bytes> <transcript>` | Reads the end of a transcript: another session's model, effort and context, or this chat's latest messages while it is off. |
 | `find ~/.claude/projects -maxdepth 2 -name <session id>.jsonl` | Finds a session's transcript. |
-| `herdr agent list` | Only if herdr is installed: gets pane names, so herdr sends show the session's name. |
+| `herdr agent list` | Gets pane names, so herdr sends show the session's name. It runs on every poll and when the earlier transcripts are read; where herdr is not installed the call fails and is ignored. |
 
-**Events it hooks**, every one passed on unchanged:
+**Events it hooks**:
 
-- `SendMessage` tool calls: it reads the recipient's name to count the conversation, and the call runs as before.
-- Submitted prompts: for a message from another session, it reads the sender's name. The prompt is not changed.
-- Its own pane: draw, scroll and close. The hint line under the prompt: it adds the clickable note.
+- `session.start`: it registers `/orchestra` and, if orchestra was on in this session, turns it back on and opens the pane. When it was off, or the transcript it watched is gone, it reads the end of this chat's transcript to count its messages for the hint line. The event is passed on unchanged.
+- `tool.call` for `SendMessage`: it reads the recipient's name to count the conversation; the call is passed on unchanged.
+- `prompt.submit`: for a message from another session, it reads the sender's name; the prompt is passed on unchanged.
+- `command.run` for `orchestra`: it answers its own command.
+- `ui.render` for its own pane: it draws the pane.
+- `ui.message` from `log`: a click on a row of its message list opens that message.
+- `ui.scroll` for its own pane: it scrolls the message list or the message itself, and pins the pane (`offset: 0`) so the pane as a whole never scrolls.
+- `ui.close`: when its own pane closes, it notes that; the event is passed on unchanged.
+- `ui.render` for `PromptHint`: while the pane is closed and this chat talks to other sessions, it replaces the hint line under the prompt with Claude Code's hint plus the clickable note, and drops the "(shift+tab to cycle)" tip when the hint starts with it. Otherwise the line is left as it is.
 
 It adds one command, `/orchestra` (the plugin is session-orchestra; the command keeps the short name). It runs no slash commands, submits no prompts, and makes no network or MCP calls.
 
