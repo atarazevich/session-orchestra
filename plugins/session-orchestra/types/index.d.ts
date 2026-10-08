@@ -10,14 +10,34 @@ export type SessionView = {
   ctx: number | null
 }
 
+// One subagent the watched session spawned (an Agent call). Not a session: it never counts as one.
+export type AgentView = {
+  // '⟡' and the id of the tool call that spawned it; its messages carry it in `from`/`to`.
+  key: string
+  type: string
+  description: string
+  agentId: string | null
+  status: 'running' | 'done'
+  model: string | null
+  tokens: number | null
+  ms: number | null
+  // When the transcript last said something about it, for the newest first.
+  ts: number
+}
+
 // One message, read from the watched session's transcript. `from`/`to` are a
-// session's name, or '@you' (the person) and '@self' (the watched session).
-export type BusLine = { id: string; ts: number; from: string; to: string; text: string }
+// session's name, an agent's key, or '@you' (the person) and '@self' (the watched session).
+// `agent`: the key of the subagent the message goes to or comes from.
+export type BusLine = { id: string; ts: number; from: string; to: string; text: string; agent?: string }
 
 declare module 'claude-code' {
   interface PluginState {
     'session-orchestra': {
       sessions: SessionView[]
+      // This chat's subagents, the newest first.
+      agents: AgentView[]
+      // Whether agent cards and lines show; the [ ⟡ agents ] switch.
+      showAgents: boolean
       bus: BusLine[]
       // Rows scrolled back from the newest message; 0 follows.
       logBack: number

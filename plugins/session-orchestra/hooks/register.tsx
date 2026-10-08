@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { BusLine, SessionView } from '../types'
+import type { AgentView, BusLine, SessionView } from '../types'
 import { demoData } from './demo'
 import type { LogRow as DrawnRow } from './log'
 
@@ -11,11 +11,16 @@ const CHUNK_BYTES = 3_000_000 // under $.process.run's 4 MiB output cap
 const OUTPUT_CAP = 4_194_304 // what $.process.run keeps of a program's output
 const KEEP = 1000
 const MAX_SESSIONS = 24
+const MAX_AGENTS = 24
 const DEMO = 'demo'
 const YOU = '@you'
 const SELF = '@self'
+// Marks a subagent: before its name on screen, and before the spawning call's id in its key, so no session name meets it.
+const AGENT = '⟡'
 
 const sessions = atom({ plugin: 'session-orchestra', key: 'sessions' } as const, [])
+const agents = atom({ plugin: 'session-orchestra', key: 'agents' } as const, [])
+const showAgents = atom({ plugin: 'session-orchestra', key: 'showAgents' } as const, true)
 const bus = atom({ plugin: 'session-orchestra', key: 'bus' } as const, [])
 const logBack = atom({ plugin: 'session-orchestra', key: 'logBack' } as const, 0)
 const selected = atom({ plugin: 'session-orchestra', key: 'selected' } as const, '')
@@ -43,26 +48,50 @@ const DUMB_ZONE = 40
 const ctxColor = (pct: number) =>
   pct < 10 ? 'gray' : pct < 20 ? 'green' : pct < 30 ? 'yellow' : pct < DUMB_ZONE ? '#FF8700' : 'red'
 
-const STATE: Record<SessionView['status'], { glyph: string; word: string; color: string }> = {
+// A session's state, and an agent's; the colour is the card's border too.
+const STATE: Record<SessionView['status'] | AgentView['status'], { glyph: string; word: string; color: string }> = {
   working: { glyph: '◐', word: 'working', color: ACCENT },
   idle: { glyph: '○', word: 'idle', color: 'gray' },
   closed: { glyph: '✕', word: 'closed', color: 'gray' },
+  running: { glyph: '◐', word: 'running', color: ACCENT },
+  done: { glyph: '✓', word: 'done', color: 'gray' },
 }
 
 // One live session as Claude Code records it in ~/.claude/sessions/<pid>.json.
 type Registered = { sessionId: string; cwd: string; name: string; status: string; messagingSocketPath?: string }
+type Block = {
+  type: string
+  text?: string
+  name?: string
+  id?: string
+  input?: Record<string, unknown>
+  tool_use_id?: string
+  is_error?: boolean
+  content?: string | Block[]
+}
 type Row = {
   type?: string
   timestamp?: string
   isMeta?: boolean
   effort?: string
   attachment?: { type?: string; prompt?: string }
+  // A tool's outcome, on the row with its tool_result; an Agent call's says launched in the background, or done.
+  toolUseResult?: string | {
+    status?: string
+    agentId?: string
+    resolvedModel?: string
+    totalTokens?: number
+    totalDurationMs?: number
+    content?: Block[]
+  }
   message?: {
     model?: string
     usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
-    content?: string | { type: string; text?: string; name?: string; input?: Record<string, unknown> }[]
+    content?: string | Block[]
   }
 }
+// The subagents of one watch by key, filled in as their rows are read.
+type Roster = Map<string, AgentView>
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
 const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim()
@@ -73,11 +102,16 @@ const dayLabel = (ts: number) => {
   const label = `${d.toDateString().slice(0, 3)} ${d.getDate()} ${d.toDateString().slice(4, 7)}`
   return d.toDateString() === new Date().toDateString() ? `Today · ${label}` : label
 }
+// 106 s → 1m 46s
+const took = (ms: number) => {
+  const s = Math.round(ms / 1000)
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s / 60) % 60}m`
+}
 const baseName = (path: string) => path.split('/').filter(Boolean).pop() ?? path
-// claude-opus-5-5 → Opus 5.5; claude-haiku-4-5-20251001 → Haiku 4.5
+// claude-opus-5-5 → Opus 5.5; claude-haiku-4-5-20251001 → Haiku 4.5; an Agent call's alias opus → Opus
 const modelName = (id: string) => {
   const m = /claude-([a-z]+)-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(id)
-  if (!m) return id
+  if (!m) return /^(opus|sonnet|haiku|fable)$/.test(id) ? id.replace(/^./, c => c.toUpperCase()) : id
   const family = (m[1] ?? '').replace(/^./, c => c.toUpperCase())
   return `${family} ${m[2]}${m[3] ? `.${m[3]}` : ''}`
 }
@@ -149,6 +183,8 @@ let geometry = { readerTop: Infinity, maxBack: 0, maxReader: 0 }
 // Earlier transcripts are read once (null until then); the live one from where the last poll stopped.
 let history: BusLine[] | null = null
 let live = { offset: 0, lines: [] as BusLine[] }
+// The watched session's subagents, a new one on every switch.
+let roster: Roster = new Map()
 // A session's model, effort and context, kept until it works again.
 const details = new Map<string, Pick<SessionView, 'model' | 'effort' | 'ctx'>>()
 
@@ -204,22 +240,69 @@ const hash = (s: string) => {
   return (x >>> 0).toString(36)
 }
 
-// The same message from and to the same sessions within 2 minutes shows once.
+// The same message from and to the same sessions within 2 minutes shows once; an agent's, once ever
+// (its result can arrive both queued mid-turn and as its own row).
 function dedupe(lines: BusLine[]): BusLine[] {
   const last = new Map<string, number>()
   return lines.filter(l => {
-    const key = `${l.from}|${l.to}|${oneLine(l.text).slice(0, 60)}`
+    const key = `${l.from}|${l.to}|${l.agent ? hash(l.text) : oneLine(l.text).slice(0, 60)}`
     const twin = last.get(key)
-    if (twin !== undefined && l.ts - twin < 120_000) return false
+    if (twin !== undefined && (l.agent || l.ts - twin < 120_000)) return false
     last.set(key, l.ts)
     return true
   })
 }
 
-function parseBus(jsonl: string, nameOf: (address: string) => string): BusLine[] {
+// The text blocks of a tool's result, joined.
+const textOf = (content: string | Block[] | undefined) =>
+  typeof content === 'string' ? content : (content ?? []).flatMap(b => (b.type === 'text' && b.text ? [b.text] : [])).join('\n\n')
+
+// A background agent's end: <task-notification><task-id>{agentId}</task-id><tool-use-id>…</tool-use-id>
+// <status>…</status><summary>…</summary><result>…</result><usage>…</usage>. A background shell's has a b… task-id.
+function notified(note: string) {
+  const tag = (name: string, from = note) => new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(from)?.[1]
+  const agentId = tag('task-id')
+  if (!agentId || !isAgentId(agentId)) return null
+  const toolId = tag('tool-use-id')
+  // the usage follows the result, which may quote its tags
+  const usage = note.slice(note.lastIndexOf('</result>') + 1)
+  const count = (name: string) => {
+    const n = Number(tag(name, usage))
+    return Number.isFinite(n) ? n : null
+  }
+  return {
+    ref: toolId ? AGENT + toolId : agentId,
+    agentId,
+    // the result is last, and may quote any tag
+    text: /<result>([\s\S]*)<\/result>/.exec(note)?.[1] ?? tag('summary') ?? '',
+    tokens: count('subagent_tokens'),
+    ms: count('duration_ms'),
+  }
+}
+
+// An object's fields that say something.
+const filled = <T extends object>(o: T) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined && v !== '')) as Partial<T>
+
+// Tells the roster what a row says of an agent: `ref` is its key, or its agentId where the row names only that.
+// Answers the agent's key, or undefined for an agent the roster cannot place. Rows come out of order (the earlier
+// transcripts are read last), so a newer row's word wins, and an older one only fills what is still unknown;
+// `sure` wins whenever it comes.
+function tell(roster: Roster, ref: string, ts: number, news: Partial<AgentView>, sure: Partial<AgentView> = {}) {
+  // A spawning call keeps what is said under its id. An agent resumed by SendMessage ends under that call's id:
+  // its agentId leads back to the call that spawned it. Not read yet, it waits under its own ref for `settle`.
+  const spawnedAs = (id: string | null | undefined) => (id ? [...roster.values()].find(a => a.type && a.agentId === id)?.key : undefined)
+  const key = roster.get(ref)?.type ? ref : (spawnedAs(news.agentId) ?? (ref.startsWith(AGENT) || news.agentId ? ref : undefined))
+  if (!key) return undefined
+  const was = roster.get(key) ?? { key, type: '', description: '', agentId: null, status: 'running', model: null, tokens: null, ms: null, ts }
+  roster.set(key, { ...(ts >= was.ts ? { ...was, ...filled(news), ts } : { ...was, ...filled(news), ...filled(was) }), ...filled(sure) })
+  return key
+}
+
+// Reads a transcript's messages; what it says of this chat's subagents goes into `roster`, and their lines carry their key.
+function parseBus(jsonl: string, nameOf: (address: string) => string, roster: Roster): BusLine[] {
   const lines: BusLine[] = []
-  const push = (ts: number, from: string, to: string, text: string) => {
-    lines.push({ id: `${ts}|${from}|${to}|${hash(text)}`, ts, from, to, text: text.trim() })
+  const push = (ts: number, from: string, to: string, text: string, agent?: string) => {
+    lines.push({ id: `${ts}|${from}|${to}|${hash(text)}`, ts, from, to, text: text.trim(), ...(agent ? { agent } : {}) })
   }
 
   for (const raw of jsonl.split('\n')) {
@@ -243,17 +326,51 @@ function parseBus(jsonl: string, nameOf: (address: string) => string): BusLine[]
         : content.find(b => b.type === 'text')?.text)
     if (said !== undefined) {
       const peer = /<cross-session-message[^>]*from-name="([^"]+)"[^>]*>([\s\S]*?)<\/cross-session-message>/.exec(said)
-      if (peer) push(ts, nameOf(peer[1] ?? '?'), SELF, peer[2] ?? '')
+      const note = /^\s*<task-notification>/.test(said) ? notified(said) : null
+      const noted = note && tell(roster, note.ref, ts, { agentId: note.agentId, status: 'done', tokens: note.tokens, ms: note.ms })
+      if (note) {
+        if (noted) push(ts, noted, SELF, note.text, noted)
+      } else if (peer) push(ts, nameOf(peer[1] ?? '?'), SELF, peer[2] ?? '')
       else if ((queued !== undefined || !row.isMeta) && !/^\s*</.test(said) && !said.startsWith('This session is being continued'))
         push(ts, YOU, SELF, said)
+    }
+
+    // An Agent call's result: launched in the background (its end comes as a task-notification), done, or failed.
+    if (row.type === 'user' && Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type !== 'tool_result' || !block.tool_use_id) continue
+        const key = AGENT + block.tool_use_id
+        const result = typeof row.toolUseResult === 'object' ? row.toolUseResult : undefined
+        if (result?.agentId && result.status === 'async_launched') {
+          // the model it runs on outranks the alias its call asked for
+          tell(roster, key, ts, { agentId: result.agentId, status: 'running' }, { model: result.resolvedModel ? modelName(result.resolvedModel) : null })
+        } else if (result?.agentId) {
+          tell(roster, key, ts, { agentId: result.agentId, status: 'done', tokens: result.totalTokens ?? null, ms: result.totalDurationMs ?? null })
+          push(ts, key, SELF, textOf(result.content ?? block.content), key)
+        } else if (block.is_error && roster.has(key)) {
+          // a failed call is an agent's only when the roster holds its call
+          tell(roster, key, ts, { status: 'done' })
+          push(ts, key, SELF, textOf(block.content), key)
+        }
+      }
     }
 
     if (row.type !== 'assistant' || content === undefined || typeof content === 'string') continue
     for (const block of content) {
       if (block.type !== 'tool_use') continue
       const input = block.input ?? {}
-      if (block.name === 'SendMessage' && typeof input.to === 'string')
-        push(ts, SELF, nameOf(input.to), String(input.message ?? ''))
+      // A subagent this chat spawns: older transcripts call the tool Task.
+      if ((block.name === 'Agent' || block.name === 'Task') && block.id) {
+        const key = AGENT + block.id
+        const model = typeof input.model === 'string' ? modelName(input.model) : null
+        tell(roster, key, ts, { type: String(input.subagent_type ?? 'general-purpose'), description: String(input.description ?? ''), status: 'running', model })
+        push(ts, SELF, key, String(input.prompt ?? ''), key)
+      }
+      // A message to an agent's id joins that agent.
+      if (block.name === 'SendMessage' && typeof input.to === 'string') {
+        const agent = isAgentId(input.to) ? tell(roster, input.to, ts, { agentId: input.to }) : undefined
+        push(ts, SELF, agent ?? nameOf(input.to), String(input.message ?? ''), agent)
+      }
       if (block.name === 'Bash' && typeof input.command === 'string') {
         for (const m of input.command.matchAll(/herdr agent prompt (w\d+:p\w+) "((?:[^"\\]|\\.)*)"/g)) {
           const text = (m[2] ?? '').replace(/\\"/g, '"')
@@ -264,6 +381,35 @@ function parseBus(jsonl: string, nameOf: (address: string) => string): BusLine[]
   }
   return lines
 }
+
+// The cards: every agent whose spawning call was read. An agent first heard of before its call (the earlier
+// transcripts are read last) folds into that call's card by agentId; one whose call was never read has no card,
+// nor lines. Answers the cards, the newest first, and the lines with each agent's key turned into its card's.
+function settle(roster: Roster, lines: BusLine[]) {
+  const typed = [...roster.values()].filter(a => a.type)
+  const cards = new Map(typed.map(a => [a.key, a]))
+  const cardOf = new Map(typed.map(a => [a.key, a.key]))
+  for (const a of roster.values()) {
+    const home = a.type ? undefined : typed.find(t => t.agentId !== null && t.agentId === a.agentId)
+    const card = home && cards.get(home.key)
+    if (!home || !card) continue
+    cards.set(home.key, a.ts >= card.ts ? { ...card, ...filled(a), key: card.key } : { ...card, ...filled(a), ...filled(card) })
+    cardOf.set(a.key, home.key)
+  }
+  const placed = lines.flatMap(l => {
+    const key = l.agent && cardOf.get(l.agent)
+    if (!l.agent) return [l]
+    if (!key) return []
+    const as = (who: string) => (who === l.agent ? key : who)
+    return [{ ...l, from: as(l.from), to: as(l.to), agent: key }]
+  })
+  return { agents: [...cards.values()].sort((a, b) => b.ts - a.ts), lines: placed }
+}
+
+// An agent's name after ⟡: its type and the end of the id of the call that spawned it.
+const agentName = (a: AgentView) => `${a.type || 'agent'}·${a.key.slice(-4)}`
+// The lines the pane shows: with the [ ⟡ agents ] switch off, no agent's.
+const onScreen = (lines: BusLine[], isShowing: boolean) => (isShowing ? lines : lines.filter(l => !l.agent))
 
 // Reads a file from a byte offset to its last complete line; answers the text and the new offset.
 // $.process.run keeps the first OUTPUT_CAP bytes of what a program writes, so a long file takes several reads.
@@ -363,13 +509,14 @@ async function poll($: EngineInterface) {
 
     const { text, offset } = await readFrom($, w.transcript, live.offset)
     if (my !== generation) return
-    live = { offset, lines: [...live.lines, ...parseBus(text, nameOf)].slice(-KEEP) }
+    live = { offset, lines: [...live.lines, ...parseBus(text, nameOf, roster)].slice(-KEEP) }
     const hasHistory = history !== null
-    const lines = dedupe([...(history ?? []), ...live.lines]).slice(-KEEP)
+    const settled = settle(roster, [...(history ?? []), ...live.lines])
+    const lines = dedupe(settled.lines).slice(-KEEP)
 
-    // The sessions this chat has talked to, the latest first.
+    // The sessions this chat has talked to, the latest first; an agent is not one.
     const lastTs = new Map<string, number>()
-    for (const l of lines) for (const who of [l.from, l.to]) if (who !== YOU && who !== SELF && !isAgentId(who)) lastTs.set(who, l.ts)
+    for (const l of lines) for (const who of [l.from, l.to]) if (!l.agent && who !== YOU && who !== SELF && !isAgentId(who)) lastTs.set(who, l.ts)
     const names = [...lastTs.keys()].sort((a, b) => (lastTs.get(b) ?? 0) - (lastTs.get(a) ?? 0)).slice(0, MAX_SESSIONS)
     const views: SessionView[] = []
     for (const name of names) {
@@ -382,15 +529,17 @@ async function poll($: EngineInterface) {
     }
     if (my !== generation) return
     await update($, sessions, () => views)
+    await update($, agents, () => settled.agents)
 
     const before = await read($, bus)
     const only = await read($, filter)
     const back = await read($, logBack)
+    const isShowing = await read($, showAgents)
     if (my !== generation) return
     await update($, bus, () => lines)
     // A reader scrolled back keeps its place: the rows new messages add to the list, day rows too, push it down.
     const newest = before[before.length - 1]?.ts ?? 0
-    const listed = lines.filter(l => !only || l.from === only || l.to === only)
+    const listed = onScreen(lines, isShowing).filter(l => !only || l.from === only || l.to === only)
     const added = withDays(listed).length - withDays(listed.filter(l => l.ts <= newest)).length
     if (my !== generation) return
     if (newest > 0 && added > 0 && back > 0) await update($, logBack, n => n + added)
@@ -421,8 +570,10 @@ async function scanOwn($: EngineInterface) {
   if (!transcript) return
   // the last 3 MB is enough to know whether this chat talks to other sessions
   const tail = await $.process.run(['tail', '-c', String(CHUNK_BYTES), transcript], { timeoutMs: 10_000 })
-  const lines = dedupe(parseBus(tail.stdout, a => a)).filter(l => l.from !== YOU)
-  const names = [...new Set(lines.flatMap(l => [l.from, l.to]))].filter(n => n !== YOU && n !== SELF && !isAgentId(n) && !n.startsWith('herdr:'))
+  // agents' lines count as the pane would show them
+  const scanned: Roster = new Map()
+  const lines = onScreen(dedupe(settle(scanned, parseBus(tail.stdout, a => a, scanned)).lines), await read($, showAgents)).filter(l => l.from !== YOU)
+  const names = [...new Set(lines.flatMap(l => (l.agent ? [] : [l.from, l.to])))].filter(n => n !== YOU && n !== SELF && !isAgentId(n) && !n.startsWith('herdr:'))
   await update($, heard, () => ({ names, count: lines.length }))
 }
 
@@ -452,6 +603,7 @@ async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'mi
   const my = ++generation
   history = null
   live = { offset: 0, lines: [] }
+  roster = new Map()
   watching = { transcript, sessionId, isOwn }
   try {
     await update($, reading, () => true)
@@ -483,10 +635,12 @@ async function turnOn($: EngineInterface, sessionId: string): Promise<'on' | 'mi
 async function readEarlier($: EngineInterface, transcript: string, found: Registered[], my: number) {
   const nameOf = await namer($, found)
   const chain = await chainOf($, transcript)
+  // the roster of this watch, not of one a later switch starts
+  const mine = roster
   const earlier: BusLine[] = []
   for (const file of chain.slice(0, -1)) {
     const got = await readFrom($, file, 0)
-    earlier.push(...parseBus(got.text, nameOf))
+    earlier.push(...parseBus(got.text, nameOf, mine))
   }
   if (my !== generation) return
   history = earlier
@@ -504,6 +658,8 @@ export const register: Register = on => {
     // In the background, so the full history read never holds up the first prompt.
     void (async () => {
       const own = await $.session.id()
+      // the [ ⟡ agents ] switch, as this session left it
+      if ((await $.store.get(`agents:${own}`)) === false) await update($, showAgents, () => false)
       const target = await $.store.get(`on:${own}`)
       const state = typeof target === 'string' ? await turnOn($, target) : 'missing'
       if (state === 'on') await openPane($)
@@ -542,7 +698,8 @@ export const register: Register = on => {
     if (await read($, paneUp)) return next(e)
     const off = watching ? null : await read($, heard)
     const n = off ? off.names.length : (await read($, sessions)).filter(v => v.status !== 'closed').length
-    const count = off ? off.count : (await read($, bus)).length
+    const isShowing = await read($, showAgents)
+    const count = off ? off.count : onScreen(await read($, bus), isShowing).length
     if (off ? !n : !n && !count) return next(e)
     const note = `◆ ${n} session${n === 1 ? '' : 's'} ⇄ ${count}`
     const { Box, Button, Text } = $.ui.resolve(e)
@@ -594,6 +751,7 @@ export const register: Register = on => {
       await update($, reading, () => false)
       const demo = demoData(await $.clock.now())
       await update($, sessions, () => demo.sessions)
+      await update($, agents, () => [])
       await update($, bus, () => demo.bus)
       await update($, selfName, () => 'this chat')
       // open on the long message, so the reader shows what it does
@@ -644,11 +802,17 @@ export const register: Register = on => {
     const width = Math.max(44, e.props.bodyColumns ?? 64)
     const height = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 40
     const views = await read($, sessions)
-    const lines = await read($, bus)
+    const spawnedViews = await read($, agents)
+    const isShowing = await read($, showAgents)
+    // every agent names its lines; the newest MAX_AGENTS get cards
+    const shownAgents = isShowing ? spawnedViews.slice(0, MAX_AGENTS) : []
+    // With the switch off, no agent's card or line shows anywhere.
+    const lines = onScreen(await read($, bus), isShowing)
     const self = await read($, selfName)
     const isReading = await read($, reading)
     const working = views.filter(v => v.status === 'working').length
-    const label = (who: string) => (who === YOU ? 'you' : who === SELF ? self || 'this chat' : who)
+    const agentNames = new Map(spawnedViews.map(a => [a.key, `${AGENT} ${agentName(a)}`]))
+    const label = (who: string) => (who === YOU ? 'you' : who === SELF ? self || 'this chat' : agentNames.get(who) ?? who)
     const colorOf = (who: string) => (who === YOU ? BOSS : who === SELF ? HUB : ACCENT)
 
     // Each section opens with a full-width rule carrying its name; a blank row before the lower two.
@@ -677,13 +841,13 @@ export const register: Register = on => {
     const gap = 1
     const spacer = (k: string) => <Box key={k} height={1}><Text> </Text></Box>
 
-    // ── SESSIONS: cards in pages, 2 wide; one row of chips when short of room
+    // ── SESSIONS: cards in pages, 2 wide, the agents' after the sessions'; one row of chips when short of room
     const open = views.filter(v => v.status !== 'closed')
-    const closed = views.filter(v => v.status === 'closed')
+    const grid: (SessionView | AgentView)[] = [...open, ...shownAgents]
     const perPage = height >= 44 ? 6 : height >= 32 ? 4 : 0
-    const pages = perPage ? Math.max(1, Math.ceil(open.length / perPage)) : 1
+    const pages = perPage ? Math.max(1, Math.ceil(grid.length / perPage)) : 1
     const at = clamp(await read($, page), 0, pages - 1)
-    const shownViews = perPage ? open.slice(at * perPage, at * perPage + perPage) : open
+    const shownViews = perPage ? grid.slice(at * perPage, at * perPage + perPage) : grid
     const cardWidth = Math.floor(width / 2)
     const inner = cardWidth - 4
     const LABEL = 9 // "47% dumb"
@@ -695,22 +859,15 @@ export const register: Register = on => {
       await update($, selected, () => '')
       await update($, logBack, () => 0)
     }
-    const card = (v: SessionView) => {
-      const state = STATE[v.status]
-      const isClosed = v.status === 'closed'
-      const pct = v.ctx ?? 0
-      const barWidth = Math.max(4, inner - LABEL)
-      const filled = isClosed || v.ctx === null ? 0 : Math.round((barWidth * pct) / 100)
-      const mark = Math.round((barWidth * DUMB_ZONE) / 100)
-      const empty = Array.from({ length: barWidth - filled }, (_, i) => (filled + i === mark ? '╎' : '┄')).join('')
-      const effort = v.effort ? EFFORT[v.effort] : undefined
-      const isDumb = !isClosed && v.ctx !== null && pct >= DUMB_ZONE
+    // A card: its name, which shows only its messages, and its state; its model and an aside; a row of its own.
+    const frame = (id: string, title: string, status: keyof typeof STATE, model: JSX.Element, aside: string, foot: JSX.Element) => {
+      const state = STATE[status]
       return (
-        <Box key={v.name} borderStyle="round" borderColor={v.name === only ? HUB : v.status === 'working' ? ACCENT : 'gray'} flexDirection="column" width={cardWidth} paddingX={1}>
+        <Box key={id} borderStyle="round" borderColor={id === only ? HUB : state.color} flexDirection="column" width={cardWidth} paddingX={1}>
           <Box flexDirection="row" justifyContent="space-between">
             <Box flexShrink={1} height={1} overflow="hidden">
-              <Button key={`s-${v.name}`} plain onPress={() => pick(v.name)}>
-                {clip(`✻ ${v.name}`, Math.max(4, inner - state.word.length - 3))}
+              <Button key={`s-${id}`} plain onPress={() => pick(id)}>
+                {clip(title, Math.max(4, inner - state.word.length - 3))}
               </Button>
             </Box>
             <Box flexShrink={0} marginLeft={1}>
@@ -719,24 +876,49 @@ export const register: Register = on => {
           </Box>
           <Box flexDirection="row" justifyContent="space-between">
             <Box flexDirection="row" gap={1} flexShrink={0}>
-              <Text color={isClosed || !v.model ? 'gray' : 'cyan'}>{v.model ?? '—'}</Text>
-              {effort && !isClosed && <Text color={effort.color}>{effort.bars}</Text>}
+              {model}
             </Box>
             <Box flexShrink={1} marginLeft={1}>
-              <Text dimColor wrap="truncate-end">{v.folder ? `📁 ${v.folder}` : ''}</Text>
+              <Text dimColor wrap="truncate-end">{aside}</Text>
             </Box>
           </Box>
-          <Box flexDirection="row">
-            <Text color={ctxColor(pct)}>{'━'.repeat(filled)}</Text>
-            <Text dimColor>{empty}</Text>
-            <Box width={LABEL} justifyContent="flex-end">
-              <Text color={isClosed || v.ctx === null ? 'gray' : ctxColor(pct)} bold={isDumb}>
-                {isClosed || v.ctx === null ? '–' : isDumb ? `${pct}% dumb` : `${pct}%`}
-              </Text>
-            </Box>
+          {foot}
+        </Box>
+      )
+    }
+    const tokens = new Intl.NumberFormat('en', { notation: 'compact' })
+    // A session's card ends in its context bar; an agent's, in the tokens and time it spent.
+    const card = (v: SessionView | AgentView) => {
+      if ('key' in v) {
+        const spent = [v.tokens === null ? '' : `${tokens.format(v.tokens)} tokens`, v.ms === null ? '' : took(v.ms)].filter(Boolean).join(' · ')
+        const model = <Text color={v.model ? 'cyan' : 'gray'}>{v.model ?? '—'}</Text>
+        return frame(v.key, `${AGENT} ${agentName(v)}`, v.status, model, v.description, <Text dimColor wrap="truncate-end">{spent || '–'}</Text>)
+      }
+      const pct = v.ctx ?? 0
+      const barWidth = Math.max(4, inner - LABEL)
+      const filled = v.ctx === null ? 0 : Math.round((barWidth * pct) / 100)
+      const mark = Math.round((barWidth * DUMB_ZONE) / 100)
+      const empty = Array.from({ length: barWidth - filled }, (_, i) => (filled + i === mark ? '╎' : '┄')).join('')
+      const effort = v.effort ? EFFORT[v.effort] : undefined
+      const isDumb = v.ctx !== null && pct >= DUMB_ZONE
+      const model = (
+        <Box flexDirection="row" gap={1}>
+          <Text color={v.model ? 'cyan' : 'gray'}>{v.model ?? '—'}</Text>
+          {effort && <Text color={effort.color}>{effort.bars}</Text>}
+        </Box>
+      )
+      const bar = (
+        <Box flexDirection="row">
+          <Text color={ctxColor(pct)}>{'━'.repeat(filled)}</Text>
+          <Text dimColor>{empty}</Text>
+          <Box width={LABEL} justifyContent="flex-end">
+            <Text color={v.ctx === null ? 'gray' : ctxColor(pct)} bold={isDumb}>
+              {v.ctx === null ? '–' : isDumb ? `${pct}% dumb` : `${pct}%`}
+            </Text>
           </Box>
         </Box>
       )
+      return frame(v.name, `✻ ${v.name}`, v.status, model, v.folder ? `📁 ${v.folder}` : '', bar)
     }
 
     const pager =
@@ -762,35 +944,26 @@ export const register: Register = on => {
         </Box>
       ) : undefined
 
-    const sessionRows = 1 + (open.length === 0 ? 1 : perPage ? Math.ceil(shownViews.length / 2) * 5 : 1)
+    const sessionRows = 1 + (grid.length === 0 ? 1 : perPage ? Math.ceil(shownViews.length / 2) * 5 : 1)
     const countsText = `${open.length} open${working ? ` · ${working} working` : ''}`
-    // the rule's fixed parts: "── " + "Sessions " + counts + " " + at least 3 dashes + "  " + "──", and the pager
-    const pagerWidth = pages > 1 ? 4 + pages * 2 + 3 : 0
-    let room = width - (3 + 9 + countsText.length + 1 + 3 + 2 + 2) - pagerWidth - 'no longer running:'.length - 1
-    const fits: SessionView[] = []
-    for (const v of closed) {
-      const need = v.name.length + 2 + (fits.length < closed.length - 1 ? 4 : 0)
-      if (need > room) break
-      fits.push(v)
-      room -= need
+    // The switch, on the Messages line, shows once this chat has spawned an agent; off, it hides their cards and lines.
+    const flip = async () => {
+      const own = await $.session.id()
+      const next = !(await read($, showAgents))
+      await update($, showAgents, () => next)
+      await $.store.set(`agents:${own}`, next)
+      await update($, filter, f => (!next && f.startsWith(AGENT) ? '' : f))
+      await update($, page, () => 0)
+      await update($, logBack, () => 0)
     }
-    const ended =
-      closed.length > 0 ? (
-        <Box flexDirection="row" gap={1} flexShrink={0}>
-          <Text dimColor>no longer running:</Text>
-          <Box flexDirection="row" gap={2}>
-            {fits.map(v => (
-              <Button key={`s-${v.name}`} plain dimColor={v.name !== only} onPress={() => pick(v.name)}>{v.name}</Button>
-            ))}
-            {closed.length > fits.length && <Text dimColor>{`+${closed.length - fits.length}`}</Text>}
-          </Box>
-        </Box>
+    const toggle =
+      spawnedViews.length > 0 ? (
+        <Button key="agents" dimColor={!isShowing} onPress={flip}>{`${AGENT} agents`}</Button>
       ) : undefined
-    const sessionsRight = pager || ended ? <Box flexDirection="row" gap={3}>{ended}{pager}</Box> : undefined
     const sessionsSection = (
       <Box flexDirection="column" height={sessionRows}>
-        {header('Sessions', countsText, sessionsRight)}
-        {open.length === 0 ? (
+        {header('Sessions', countsText, pager)}
+        {grid.length === 0 ? (
           <Text dimColor>{isReading ? 'Reading the transcripts…' : 'None open. A session shows here once this chat messages it or hears from it.'}</Text>
         ) : perPage ? (
           Array.from({ length: Math.ceil(shownViews.length / 2) }, (_, r) => (
@@ -800,10 +973,10 @@ export const register: Register = on => {
           ))
         ) : (
           <Box flexDirection="row" gap={2} height={1} overflow="hidden">
-            {open.map(v => (
-              <Box key={v.name} flexDirection="row" gap={1}>
-                <Text color={STATE[v.status].color}>{STATE[v.status].glyph} {v.name}</Text>
-                <Text color={ctxColor(v.ctx ?? 0)}>{v.ctx === null ? '–' : `${v.ctx}%`}</Text>
+            {grid.map(v => (
+              <Box key={'key' in v ? v.key : v.name} flexDirection="row" gap={1}>
+                <Text color={STATE[v.status].color}>{STATE[v.status].glyph} {'key' in v ? `${AGENT} ${agentName(v)}` : v.name}</Text>
+                {!('key' in v) && <Text color={ctxColor(v.ctx ?? 0)}>{v.ctx === null ? '–' : `${v.ctx}%`}</Text>}
               </Box>
             ))}
           </Box>
@@ -898,14 +1071,17 @@ export const register: Register = on => {
         {spacer('gap1')}
         {header(
           'Messages',
-          `${only ? `${listed.length} with ${only}` : lines.length}${isReading ? ' · reading earlier…' : ''}`,
-          only ? (
-            <Button key="all" onPress={() => pick(only)}>all</Button>
-          ) : back > 0 ? (
-            <Button key="follow" onPress={() => update($, logBack, () => 0)}>{`↓ ${back} newer`}</Button>
-          ) : (
-            <Text dimColor>wheel to scroll · click to read</Text>
-          ),
+          `${only ? `${listed.length} with ${label(only)}` : lines.length}${isReading ? ' · reading earlier…' : ''}`,
+          <Box flexDirection="row" gap={3}>
+            {toggle}
+            {only ? (
+              <Button key="all" onPress={() => pick(only)}>all</Button>
+            ) : back > 0 ? (
+              <Button key="follow" onPress={() => update($, logBack, () => 0)}>{`↓ ${back} newer`}</Button>
+            ) : (
+              <Text dimColor>wheel to scroll · click to read</Text>
+            )}
+          </Box>,
         )}
         <Box flexDirection="column" height={logRows} overflow="hidden">
           {listed.length === 0 && <Text dimColor>{isReading ? 'Reading…' : 'Quiet so far.'}</Text>}
