@@ -28,7 +28,7 @@ Orchestra is **a view, and only a view**:
 - It **reads** files Claude Code already writes on your machine: the transcripts and Claude Code's list of running sessions.
 - It **does not send, change or delete** anything. It is not a messaging channel and adds none: your sessions talk exactly as they did before, through `SendMessage`.
 - It **makes no network calls**.
-- The only thing it keeps is whether it is on in a session, and which page of cards you were on.
+- The only things it keeps are whether it is on in a session, whether agents show there, and which page of cards you were on.
 
 ## The pane
 
@@ -42,7 +42,13 @@ One card for each session this chat has messaged or heard from, the most recent 
 - its model, its effort (`▂` low to `▂▄▆█` max) and its folder;
 - its context window in use, as a bar marked at 40 %; past 40 % the card says `dumb`.
 
-Six cards to a page (`‹ 1 2 ›`). Sessions that are no longer running are named at the right end of the Sessions line. **Click a session's name** to show only its messages; click it again, or `[ all ]`, to show every one.
+Six cards to a page (`‹ 1 2 ›`). Messages from sessions that are no longer running stay in the list. **Click a session's name** to show only its messages; click it again, or `[ all ]`, to show every one.
+
+### Agents
+
+The subagents this chat spawns (its `Agent` calls) share the grid, after the sessions, marked `⟡`: the agent's type and the end of its id, **running** or **done**, its model when known, its task, and the tokens and time it took. Each call is two lines in Messages, the prompt (`this chat → ⟡ developer·a57b`) and the result, read in full like any message; a background agent's result arrives when it finishes. Clicking an agent's name shows only its messages.
+
+Agents are not sessions: no session count includes them. `[ ⟡ agents ]` on the Messages line hides or shows all their cards and lines; it is on by default and remembered per session. Agents spawned by other agents are not shown.
 
 ### Messages
 
@@ -64,7 +70,7 @@ The sessions stay where they are while the two lists scroll.
 
 ![The note under the pointer](docs/hint-hover.png)
 
-The dim hint line under the prompt ends with a note, next to Claude Code's own (`← 5 agents`): `◆ 4 sessions ⇄ 41`, the sessions this chat talks to and the messages between them. **Click it** to open the pane. In a session where orchestra is off, the note appears once this chat messages another session or hears from one; a click turns orchestra on there. Nothing pops up.
+The dim hint line under the prompt ends with a note, next to Claude Code's own (`← 5 agents`): `◆ 4 sessions ⇄ 41`, the sessions this chat talks to and the messages the pane shows. **Click it** to open the pane. In a session where orchestra is off, the note appears once this chat messages another session or hears from one; a click turns orchestra on there. Nothing pops up.
 
 ## Install
 
@@ -106,6 +112,7 @@ The pane docks as a sidebar from 144 terminal columns; at any width `/orchestra`
 | Who talks to whom, and every message | This session's transcript: its `SendMessage` calls, the messages other sessions sent it (arrived idle or mid-turn), your prompts. A compacted session is followed back through its earlier transcripts. |
 | Working or idle | `~/.claude/sessions/`, Claude Code's own record of the sessions running on this machine (the one `ListAgents` reads). |
 | Model, effort, context | The last reply in each session's own transcript. |
+| Agents | This session's transcript: its `Agent` calls, their results, and the notice a background agent sends when it ends. |
 
 If you run your sessions in herdr, its `herdr agent prompt <pane> "…"` sends count as messages too.
 
