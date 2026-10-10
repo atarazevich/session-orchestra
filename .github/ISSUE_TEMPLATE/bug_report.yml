@@ -1,0 +1,30 @@
+name: Bug report
+description: Something in the pane is wrong or missing.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what the pane showed, and what you expected. A screenshot helps; remove anything private first.
+    validations:
+      required: true
+  - type: input
+    id: claude
+    attributes:
+      label: Claude Code version
+      placeholder: claude --version
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin version
+      placeholder: e.g. 0.2.0 (shown in /plugin)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and terminal
+      placeholder: e.g. macOS 27, Ghostty
