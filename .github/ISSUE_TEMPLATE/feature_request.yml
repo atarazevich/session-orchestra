@@ -1,0 +1,16 @@
+name: Feature request
+description: Something the pane should show or do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to see or do, and why the pane does not help today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: Optional. How you picture it.
