@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-86B4AE?style=flat)](https://github.com/atarazevich/session-orchestra/blob/main/LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-F4812B?style=flat)](https://docs.claude.com/en/docs/claude-code)
-[![Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fatarazevich%2Fsession-orchestra%2Fmain%2Fplugins%2Fsession-orchestra%2F.claude-plugin%2Fplugin.json&query=%24.version&label=version&color=E9BF74&style=flat)](https://github.com/atarazevich/session-orchestra/blob/main/plugins/session-orchestra/.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fatarazevich%2Fsession-orchestra%2Fmain%2Fplugins%2Fsession-orchestra%2F.claude-plugin%2Fplugin.json&query=%24.version&label=version&color=E9BF74&style=flat)](https://github.com/atarazevich/session-orchestra/blob/main/CHANGELOG.md)
 [![Read-only, no network calls](https://img.shields.io/badge/read--only-no%20network%20calls-A58BAF?style=flat)](https://github.com/atarazevich/session-orchestra/blob/main/PRIVACY.md)
 [![GitHub stars](https://img.shields.io/github/stars/atarazevich/session-orchestra?style=flat&color=86B4AE)](https://github.com/atarazevich/session-orchestra/stargazers)
 [![Last commit](https://img.shields.io/github/last-commit/atarazevich/session-orchestra?style=flat&color=86B4AE)](https://github.com/atarazevich/session-orchestra/commits/main)
@@ -154,6 +154,10 @@ It reads only files on your machine and sends nothing. The full statement: [Priv
 - It reads Claude Code's transcript format, which is not a public interface; a release can change it. Tested on 2.1.289.
 - Context % is computed from the last reply's tokens and the model's window (1M; 200k for Haiku and 4.x models). In testing it matched the status line, but it is not the number Claude Code itself reports.
 - Sessions on this machine only.
+
+## Version history
+
+See [CHANGELOG.md](CHANGELOG.md). The version badge links there too.
 
 ## Development
 
